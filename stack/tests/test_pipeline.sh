@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# Offline check of work-issue.sh + dispatch.sh: real git against a local bare "origin",
+# stubbed gh/opencode/timeout/setsid on PATH. Run: bash stack/tests/test_pipeline.sh
+set -euo pipefail
+STACK="$(cd "$(dirname "$0")/.." && pwd)"
+T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
+pass=0; fail=0
+check() { if eval "$2"; then pass=$((pass+1)); else fail=$((fail+1)); echo "FAIL: $1"; fi; }
+
+# --- origin repo ---
+git init -q -b main "$T/seed" && git -C "$T/seed" -c user.name=t -c user.email=t@t commit -q --allow-empty -m init
+git clone -q --bare "$T/seed" "$T/origin.git"
+
+# --- installed layout: scripts + stack.env side by side, like $HERMES_HOME/scripts ---
+mkdir -p "$T/scripts" "$T/bin"
+cp "$STACK"/scripts/*.sh "$T/scripts/"
+sed -e 's|^REPO=.*|REPO="acme/app"|' -e "s|^WORK_ROOT=.*|WORK_ROOT=\"$T/work\"|" \
+  "$STACK/config/stack.env" > "$T/scripts/stack.env"
+
+# --- stubs ---
+cat > "$T/bin/gh" <<EOF
+#!/usr/bin/env bash
+echo "gh \$*" >> "$T/gh.log"
+case "\$1 \$2" in
+  "repo clone") git clone -q "$T/origin.git" "\$4" ;;
+  "issue view") [[ "\$*" == *.title* ]] && echo "Fix the thing" || echo "Please fix it." ;;
+  "pr create")  echo "https://github.com/acme/app/pull/7" ;;
+  "issue list") [[ "\$*" == *agent-working* ]] && echo "\${WORKING:-0}" || printf '11\n12\n13\n' ;;
+  api*) [[ "\$*" == *protection* ]] && { [ -n "\${PROTECTED:-}" ] && echo 1 || exit 1; } || echo "\${AUTOMERGE:-false}" ;;
+esac
+EOF
+cat > "$T/bin/opencode" <<EOF
+#!/usr/bin/env bash
+echo "token=\${GH_TOKEN:-none}" >> "$T/runner.log"
+case "\${RUNNER_DOES:-edit}" in
+  edit) echo fixed > fix.txt ;;
+  ci) mkdir -p .github && echo x > .github/ci.yml ;;
+  none) : ;;
+esac
+EOF
+printf '#!/usr/bin/env bash\nshift; exec "$@"\n' > "$T/bin/timeout"
+printf '#!/usr/bin/env bash\nexec "$@"\n' > "$T/bin/setsid"
+chmod +x "$T"/bin/* "$T"/scripts/*.sh
+export PATH="$T/bin:$PATH" GH_TOKEN=secret
+
+run() { rm -f "$T/gh.log" "$T/runner.log"; env "$@" "$T/scripts/work-issue.sh" 5 >/dev/null 2>&1 || true; }
+
+# 1. happy path, repo passes readiness gate -> PR + auto-merge
+run AUTOMERGE=true PROTECTED=1
+check "pushes branch" 'git -C "$T/origin.git" rev-parse -q --verify agent/issue-5 >/dev/null'
+check "opens PR" 'grep -q "pr create" "$T/gh.log"'
+check "auto-merge on" 'grep -q "pr merge .* --auto" "$T/gh.log"'
+check "labels agent-pr" 'grep -q "add-label agent-pr" "$T/gh.log"'
+check "runner never sees GH_TOKEN" 'grep -q "token=none" "$T/runner.log"'
+check "worktree cleaned" '[ ! -d "$T/work/wt/5" ]'
+
+# 2. no branch protection -> PR only
+run AUTOMERGE=true
+check "PR-only without protection" '! grep -q "pr merge" "$T/gh.log" && grep -q "pr create" "$T/gh.log"'
+
+# 3. runner changes nothing -> needs-human
+run RUNNER_DOES=none
+check "no-change -> needs-human" 'grep -q "add-label needs-human" "$T/gh.log" && ! grep -q "pr create" "$T/gh.log"'
+
+# 4. runner touches .github/ -> blocked
+run RUNNER_DOES=ci AUTOMERGE=true PROTECTED=1
+check "protected path -> needs-human" 'grep -q "add-label needs-human" "$T/gh.log" && ! grep -q "pr create" "$T/gh.log"'
+
+# 5. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
+rm -f "$T/gh.log"
+out="$(WORKING=1 RUNNER_DOES=none "$T/scripts/dispatch.sh")"; sleep 1
+check "dispatch respects MAX_PARALLEL" '[ "$out" = "Dispatched #11 to opencode" ]'
+check "dispatch claims before launch" 'grep -q "issue edit 11 .*--add-label agent-working" "$T/gh.log"'
+out="$(WORKING=2 "$T/scripts/dispatch.sh")"
+check "dispatch silent when full" '[ -z "$out" ]'
+
+echo "passed $pass, failed $fail"
+[ "$fail" -eq 0 ]

@@ -1,0 +1,5 @@
+hermes-agent/
+.DS_Store
+.env
+*.log
+.claude/skills/
