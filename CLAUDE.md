@@ -12,16 +12,23 @@ hermes_agent/
 ├── hermes-agent/    # upstream NousResearch clone — READ-ONLY, never edit
 └── stack/                       # our glue layer
     ├── config/stack.env         # THE config: repo, runner, models, limits, merge mode
-    ├── scripts/triage-feed.sh   # pre-run script for the triage cron job (untriaged issues → prompt)
+    ├── scripts/triage.sh        # no-agent cron job: OpenCode returns a verdict, script applies the label
     ├── scripts/dispatch.sh      # no-agent cron job: agent-ready → agent-working, launches workers
     ├── scripts/work-issue.sh    # one issue: fresh clone → runner → PR → auto-merge (guardrails live here)
-    ├── skills/issue-triage/     # Hermes skill: label agent-ready / needs-human
-    ├── deploy/install.sh        # VPS install (copies into ~/.hermes, sets model, labels, cron jobs)
+    ├── deploy/Dockerfile        # official Hermes image + gh, opencode, runner1/runner2/triager users
+    ├── deploy/docker-compose.yml# local stand-in for the VPS (token in gitignored deploy/.env)
+    ├── deploy/install.sh        # install into HERMES_HOME: scripts, labels, cron jobs
     └── tests/test_pipeline.sh   # offline check, stubbed gh/opencode — run after any script change
 ```
 
-**Flow:** Hermes cron `agent-triage` (every 10m, LLM + skill) labels the issues. Hermes cron
-`agent-dispatch` (every 5m, no LLM) starts `work-issue.sh` on up to `MAX_PARALLEL` ready issues.
+**Flow:** Hermes cron `agent-triage` (every 10m) runs `triage.sh`. It asks OpenCode (`TRIAGE_MODEL`)
+for a verdict and applies the label in code. Hermes cron `agent-dispatch` (every 5m) starts
+`work-issue.sh` on up to `MAX_PARALLEL` ready issues. Both are no-agent jobs. Hermes needs no model of
+its own, because OpenCode's free tier only works from inside OpenCode.
+
+**Isolation:** each coding task runs as its slot's unix user (`runner1`/`runner2`), and triage runs
+as `triager`. None of these users can read `HERMES_HOME`, which holds `GH_TOKEN`, or the git dir.
+After every run, all their processes are killed and their home directories are wiped.
 GitHub labels are the only state: `agent-ready → agent-working → agent-pr | needs-human`.
 
 **Why cron + scripts and not Hermes kanban:** kanban workers are Hermes profiles. An external CLI lane
@@ -53,7 +60,7 @@ Hermes already ships most of what we need. Look there before writing anything:
 
 - Run OpenCode headless in a checkout:
   `opencode run --dir <checkout> -m opencode/longcat-2.5-preview-free "<task>"`
-- Run Hermes once, non-interactively: `hermes -z "<prompt>"`
+- Local stack: `cd stack/deploy && docker compose up -d --build && docker compose exec hermes bash /stack/deploy/install.sh`
 - The model is `opencode/longcat-2.5-preview-free`, and the fallback is `opencode/nemotron-3-ultra-free`.
   - Both are set in **one place** in `stack/config/`.
   - Never hardcode the model name anywhere else.

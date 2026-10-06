@@ -22,7 +22,7 @@ GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──�
 ```
 
 1. **Intake:** GitHub Issues on one target repo.
-2. **Triage:** Hermes reads every new issue and labels it `agent-ready` or `needs-human`.
+2. **Triage:** a Hermes cron job sends each new issue to OpenCode for a verdict and labels it `agent-ready` or `needs-human` in code.
    - Humans can add or remove the label to override Hermes.
    - Only `agent-ready` issues are worked.
 3. **Execution:** Hermes dispatches each `agent-ready` issue to **OpenCode** headless, in its own throwaway clone.
@@ -46,10 +46,10 @@ GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──�
 |---|---|
 | Orchestrator / triage | Hermes Agent (`hermes-agent/`, upstream NousResearch), systemd service on our VPS |
 | Coding agent | OpenCode (headless) |
-| Model (Hermes + OpenCode) | `opencode/longcat-2.5-preview-free` via OpenCode Zen. Fallback: `opencode/nemotron-3-ultra-free` |
+| Model (all LLM work, through OpenCode) | Coding: `opencode/longcat-2.5-preview-free` (fallback `opencode/nemotron-3-ultra-free`). Triage: `opencode/nemotron-3.5-lightning-free`. Hermes itself needs no model (OpenCode free tier is OpenCode-only) |
 | Intake | GitHub Issues |
 | Identity | Dedicated GitHub bot account, fine-grained PAT scoped to the target repo |
-| Isolation | One throwaway git clone per issue on the VPS host (separate unix user: pending) |
+| Isolation | One throwaway clone per issue; coding agent runs as a per-slot unprivileged unix user that can't read secrets or git metadata |
 | Target repo | `Abhijit7979/testing-my-agent-layer` (private sandbox: Python + pytest + CI) |
 
 The free preview model is accepted for the pilot only. Its data policy, rate limits and availability are

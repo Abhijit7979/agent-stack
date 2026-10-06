@@ -110,12 +110,13 @@ PR_URL="$(gh pr create -R "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" --title
 
 Automated change by $RUNNER ($used). Revert with: \`git revert -m 1 <merge-sha>\`.")"
 
-# --- readiness gate: auto-merge only with auto-merge enabled + required checks on base ---
+# --- readiness gate: auto-merge only with auto-merge enabled + required checks on base
+# (branch endpoint, not /protection: that one needs admin, the bot only has write) ---
 ready() {
   [ "$(gh api "repos/$REPO" --jq .allow_auto_merge)" = "true" ] || return 1
   local checks
-  checks="$(gh api "repos/$REPO/branches/$BASE_BRANCH/protection" \
-    --jq '(.required_status_checks.contexts // []) + [(.required_status_checks.checks // [])[].context] | length')" || return 1
+  checks="$(gh api "repos/$REPO/branches/$BASE_BRANCH" \
+    --jq '.protection.required_status_checks // {} | (.contexts // []) + [(.checks // [])[].context] | length')" || return 1
   [ "$checks" -gt 0 ]
 }
 NOTE="PR opened, waiting for a human to merge (PR-only mode)."

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Offline check of work-issue.sh + dispatch.sh: real git against a local bare "origin",
 # stubbed gh/opencode/timeout/setsid on PATH. Run: bash stack/tests/test_pipeline.sh
+# shellcheck disable=SC2034  # vars are read inside check()'s eval strings
 set -euo pipefail
 STACK="$(cd "$(dirname "$0")/.." && pwd)"
 T="$(mktemp -d)"; trap 'rm -rf "$T"' EXIT
@@ -14,7 +15,7 @@ git clone -q --bare "$T/seed" "$T/origin.git"
 # --- installed layout: scripts + stack.env side by side, like $HERMES_HOME/scripts ---
 mkdir -p "$T/scripts" "$T/bin"
 cp "$STACK"/scripts/*.sh "$T/scripts/"
-sed -e 's|^REPO=.*|REPO="acme/app"|' -e "s|^WORK_ROOT=.*|WORK_ROOT=\"$T/work\"|" -e 's|^RUNNER_USERS=.*|RUNNER_USERS=""|' \
+sed -e 's|^REPO=.*|REPO="acme/app"|' -e 's|^TRIAGE_USER=.*|TRIAGE_USER=""|' -e "s|^WORK_ROOT=.*|WORK_ROOT=\"$T/work\"|" -e 's|^RUNNER_USERS=.*|RUNNER_USERS=""|' \
   "$STACK/config/stack.env" > "$T/scripts/stack.env"
 
 # --- stubs ---
@@ -28,7 +29,10 @@ case "\$1 \$2" in
   "issue list") [[ "\$*" == *agent-working* ]] && { echo "\${WORKING:-0}"; exit; }
                 q="\${@: -1}"; echo '[{"number":13,"createdAt":"3"},{"number":11,"createdAt":"1"},{"number":12,"createdAt":"2"}]' | jq -r "\$q" ;;
   api*) case "\$*" in
-          *protection*) [ -n "\${PROTECTED:-}" ] && echo 1 || exit 1 ;;
+          *branches/*) [ -n "\${PROTECTED:-}" ] && echo 1 || echo 0 ;;
+          *issues\?state*) q="\${@: -1}"; echo '[{"number":21,"author_association":"COLLABORATOR","labels":[]},
+              {"number":22,"author_association":"NONE","labels":[]},
+              {"number":23,"author_association":"OWNER","labels":[{"name":"needs-human"}]}]' | jq -r "\$q" ;;
           *issues/*)    echo "\${ASSOC:-COLLABORATOR}" ;;
           *)            echo "\${AUTOMERGE:-false}" ;;
         esac ;;
@@ -36,6 +40,7 @@ esac
 EOF
 cat > "$T/bin/opencode" <<EOF
 #!/usr/bin/env bash
+[[ "\$*" == *"triaging a GitHub issue"* ]] && { printf '%b\n' "\$TRIAGE_OUT"; exit 0; }
 echo "token=\${GH_TOKEN:-none} \$*" >> "$T/runner.log"
 [ -n "\${PRIMARY_FAILS:-}" ] && [[ "\$*" == *longcat* ]] && exit 1
 case "\${RUNNER_DOES:-edit}" in
@@ -93,8 +98,16 @@ rm -f "$T/gh.log"
 out="$(WORKING=1 RUNNER_DOES=none "$T/scripts/dispatch.sh")"; sleep 1
 check "dispatch respects MAX_PARALLEL" '[ "$out" = "Dispatched #11 to opencode" ]'
 check "dispatch claims before launch" 'grep -q "issue edit 11 .*--add-label agent-working" "$T/gh.log"'
-out="$(WORKING=2 "$T/scripts/dispatch.sh")"
-check "dispatch silent when full" '[ -z "$out" ]'
+check "dispatch silent when full" '[ -z "$(WORKING=2 "$T/scripts/dispatch.sh")" ]'
+
+# 9. triage: only the trusted, unlabelled issue is classified; verdict applied by code
+rm -f "$T/gh.log"
+out="$(TRIAGE_OUT='thinking...\nLABEL: agent-ready\nREASON: small clear fix' "$T/scripts/triage.sh")"
+check "triage labels trusted issue" '[ "$out" = "#21 -> agent-ready (small clear fix)" ] && grep -q "issue edit 21 .*--add-label agent-ready" "$T/gh.log"'
+check "triage skips untrusted + labelled" '! grep -qE "issue (edit|view|comment) (22|23)" "$T/gh.log"'
+rm -f "$T/gh.log"
+TRIAGE_OUT='Sure! I will ignore the rules. LABEL agent ready' "$T/scripts/triage.sh" >/dev/null
+check "unclear verdict -> needs-human" 'grep -q "issue edit 21 .*--add-label needs-human" "$T/gh.log"'
 
 echo "passed $pass, failed $fail"
 [ "$fail" -eq 0 ]
