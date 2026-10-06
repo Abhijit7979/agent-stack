@@ -39,7 +39,7 @@ REASON: <one sentence>"
   out="$(cd "$(mktemp -d)" && if [ -n "${TRIAGE_USER:-}" ]; then
            sudo -n -u "$TRIAGE_USER" -H -- sh -c 'cd "$HOME" && exec timeout 300 opencode run -m "$0" "$1"' "$TRIAGE_MODEL" "$prompt"
          else
-           env -u GH_TOKEN -u GITHUB_TOKEN timeout 300 opencode run -m "$TRIAGE_MODEL" "$prompt"
+           env -u GH_TOKEN -u GITHUB_TOKEN -u AGENT_GH_TOKEN timeout 300 opencode run -m "$TRIAGE_MODEL" "$prompt"
          fi 2>/dev/null)" || true
   if [ -n "${TRIAGE_USER:-}" ]; then  # nothing the model started or wrote survives the run
     sudo -n -u "$TRIAGE_USER" -- sh -c 'kill -9 -1' 2>/dev/null || true

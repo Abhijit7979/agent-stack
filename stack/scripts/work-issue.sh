@@ -71,7 +71,7 @@ as_runner() {
   if [ -n "$U" ]; then
     sudo -n -u "$U" -H -- sh -c 'cd "$0" && exec "$@"' "$WT" "$@"
   else
-    (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN "$@")
+    (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN -u AGENT_GH_TOKEN "$@")
   fi
 }
 run_runner() {  # $1 = model, $2 = seconds

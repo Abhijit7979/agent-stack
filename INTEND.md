@@ -106,5 +106,6 @@ Deadline: 2 weeks from the start, with the metrics above being tracked.
 ## Open items
 
 - [x] Name the target repo and confirm it passes the readiness gate (CI `test` required, auto-merge on).
-- [ ] Create the bot account and PAT, and set up branch protection.
-- [ ] Provision Hermes and OpenCode on the VPS.
+- [x] Create the bot account and token (classic, `repo` scope only), and set up branch protection.
+- [x] Local Docker run end to end: issue #1 → triage → OpenCode → PR #2 → CI green → auto-merged (2026-10-06).
+- [ ] Provision Hermes and OpenCode on the VPS (same Docker setup).
