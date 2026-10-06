@@ -5,6 +5,7 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/stack.env"
+umask 002  # checkout is group-writable so RUNNER_USER (same group) can edit it
 
 N="$1"
 BRANCH="agent/issue-$N"
@@ -27,6 +28,7 @@ case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a re
 rm -rf "$WT"
 gh repo clone "$REPO" "$WT" -- -q --depth 1 -b "$BASE_BRANCH"
 git -C "$WT" checkout -q -b "$BRANCH"
+chmod -R go-w "$WT/.git"  # runner may edit the work tree, never git internals
 
 TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
@@ -45,13 +47,18 @@ Rules:
 - Do not edit CI config (.github/), .env files, or anything holding secrets.
 - If the issue is unclear or unsafe to do, change nothing."
 
-# --- run the coding agent; GitHub token is stripped so it cannot push/merge on its own ---
-# ponytail: runner runs as our own unix user, so it could still read ~/.hermes/.env or shadow `gh`
-# on PATH. These git checks are defence in depth only; the real fix is a separate unprivileged user
-# or a container per task — required before pointing this at a company repo.
+# --- run the coding agent as RUNNER_USER: sudo resets the env (no GH_TOKEN) and that user can't
+# read $HERMES_HOME. Empty RUNNER_USER = same user, token merely stripped (local tests only).
+as_runner() {
+  if [ -n "${RUNNER_USER:-}" ]; then
+    sudo -n -u "$RUNNER_USER" -H -- sh -c 'umask 002; cd "$0" && exec "$@"' "$WT" "$@"
+  else
+    (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN "$@")
+  fi
+}
 run_runner() {  # $1 = model, $2 = seconds
   case "$RUNNER" in
-    opencode) (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN timeout "$2" opencode run -m "$1" "$PROMPT") ;;
+    opencode) as_runner timeout "$2" opencode run -m "$1" "$PROMPT" ;;
     *) echo "unknown RUNNER=$RUNNER" >&2; return 2 ;;
   esac
 }

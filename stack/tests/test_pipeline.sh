@@ -14,7 +14,7 @@ git clone -q --bare "$T/seed" "$T/origin.git"
 # --- installed layout: scripts + stack.env side by side, like $HERMES_HOME/scripts ---
 mkdir -p "$T/scripts" "$T/bin"
 cp "$STACK"/scripts/*.sh "$T/scripts/"
-sed -e 's|^REPO=.*|REPO="acme/app"|' -e "s|^WORK_ROOT=.*|WORK_ROOT=\"$T/work\"|" \
+sed -e 's|^REPO=.*|REPO="acme/app"|' -e "s|^WORK_ROOT=.*|WORK_ROOT=\"$T/work\"|" -e 's|^RUNNER_USER=.*|RUNNER_USER=""|' \
   "$STACK/config/stack.env" > "$T/scripts/stack.env"
 
 # --- stubs ---

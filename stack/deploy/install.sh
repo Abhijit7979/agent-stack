@@ -17,10 +17,10 @@ cp "$STACK/config/stack.env" "$STACK"/scripts/*.sh "$HH/scripts/"
 chmod +x "$HH"/scripts/{dispatch,work-issue,triage-feed}.sh
 rm -rf "$HH/skills/issue-triage" && cp -r "$STACK/skills/issue-triage" "$HH/skills/"
 
-# 2. Hermes runs on the same free model as the runner (INTEND.md: one provider).
-hermes config set model.provider opencode-zen
-hermes config set model.default "${MODEL#opencode/}"
-hermes config set model.base_url https://opencode.ai/zen/v1
+# 2. Hermes's own model: NOT set here. OpenCode's free tier only works from inside OpenCode
+#    ("FreeTierError"), so Hermes needs its own provider — configure with `hermes model`.
+mkdir -p "$WORK_ROOT/wt" "$WORK_ROOT/logs"
+[ -z "${RUNNER_USER:-}" ] || sudo -n -u "$RUNNER_USER" true || { echo "cannot sudo to $RUNNER_USER" >&2; exit 1; }
 
 # 3. GitHub: git pushes via gh's token; labels the pipeline uses.
 gh auth setup-git
