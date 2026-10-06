@@ -5,18 +5,21 @@
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/stack.env"
-umask 002  # checkout is group-writable so RUNNER_USER (same group) can edit it
 
 N="$1"
 BRANCH="agent/issue-$N"
-WT="$WORK_ROOT/wt/$N"
+WT="$WORK_ROOT/wt/$N"   # work tree: shared with RUNNER_USER via the setgid group on wt/
+GD="$WORK_ROOT/git/$N"  # git metadata: hermes-only, the runner can't read or replace it
 
 fail() {
   gh issue comment "$N" -R "$REPO" --body "🤖 Agent stopped: $1. Handing back to a human." || true
   gh issue edit "$N" -R "$REPO" --remove-label agent-working --add-label needs-human || true
   exit 1
 }
-cleanup() { rm -rf "$WT"; }
+cleanup() {
+  [ -z "${RUNNER_USER:-}" ] || sudo -n -u "$RUNNER_USER" -- rm -rf "$WT" 2>/dev/null || true  # runner-owned files
+  rm -rf "$WT" "$GD"
+}
 trap cleanup EXIT
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
@@ -25,10 +28,10 @@ ASSOC="$(gh api "repos/$REPO/issues/$N" --jq .author_association)"
 case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a repo collaborator ($ASSOC)" ;; esac
 
 # --- workspace: throwaway clone per issue, so nothing the runner leaves behind outlives the task ---
-rm -rf "$WT"
-gh repo clone "$REPO" "$WT" -- -q --depth 1 -b "$BASE_BRANCH"
+cleanup
+mkdir -p "$WORK_ROOT/wt"; [ -d "$WORK_ROOT/git" ] || mkdir -m 700 "$WORK_ROOT/git"
+(umask 002 && gh repo clone "$REPO" "$WT" -- -q --separate-git-dir "$GD" --depth 1 -b "$BASE_BRANCH")
 git -C "$WT" checkout -q -b "$BRANCH"
-chmod -R go-w "$WT/.git"  # runner may edit the work tree, never git internals
 
 TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
@@ -51,7 +54,7 @@ Rules:
 # read $HERMES_HOME. Empty RUNNER_USER = same user, token merely stripped (local tests only).
 as_runner() {
   if [ -n "${RUNNER_USER:-}" ]; then
-    sudo -n -u "$RUNNER_USER" -H -- sh -c 'umask 002; cd "$0" && exec "$@"' "$WT" "$@"
+    sudo -n -u "$RUNNER_USER" -H -- sh -c 'umask 002; cd "$0" && exec "$@"' "$WT" "$@"  # env reset by sudo
   else
     (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN "$@")
   fi
@@ -62,13 +65,11 @@ run_runner() {  # $1 = model, $2 = seconds
     *) echo "unknown RUNNER=$RUNNER" >&2; return 2 ;;
   esac
 }
-# Fingerprint git config/hooks the runner could tamper with to run code under our GH_TOKEN later.
-gitstate() { cat "$WT/.git/config"; ls -la "$WT/.git/hooks"; }
-before="$(gitstate | cksum)"
-# Every git call after the runner: ignore user/system config (runner could edit ~/.gitconfig), no hooks,
-# no fsmonitor; push auth comes explicitly from gh.
-SAFE_GIT=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c core.hooksPath=/dev/null
-  -c core.fsmonitor=false -c credential.helper= -c "credential.helper=!gh auth git-credential" -C "$WT")
+# Every git call after the runner: explicit hermes-only git dir (ignore whatever `.git` the runner left
+# in the work tree), no user/system config, no hooks, no fsmonitor; push auth comes explicitly from gh.
+SAFE_GIT=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git --git-dir="$GD" --work-tree="$WT"
+  -c core.hooksPath=/dev/null -c core.fsmonitor=false -c credential.helper=
+  -c "credential.helper=!gh auth git-credential")
 trap - ERR
 deadline=$((SECONDS + TASK_TIMEOUT)); used="$MODEL"
 for model in "$MODEL" "$FALLBACK_MODEL"; do
@@ -79,7 +80,6 @@ for model in "$MODEL" "$FALLBACK_MODEL"; do
 done
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
-[ "$(gitstate | cksum)" = "$before" ] || fail "the coding agent modified git config or hooks"
 "${SAFE_GIT[@]}" add -A
 CHANGED="$("${SAFE_GIT[@]}" diff --cached --name-only)"
 [ -n "$CHANGED" ] || fail "the coding agent produced no changes (or ran out of its $((TASK_TIMEOUT / 60))-minute budget)"

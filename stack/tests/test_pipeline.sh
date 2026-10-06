@@ -22,7 +22,7 @@ cat > "$T/bin/gh" <<EOF
 #!/usr/bin/env bash
 echo "gh \$*" >> "$T/gh.log"
 case "\$1 \$2" in
-  "repo clone") git clone -q "$T/origin.git" "\$4" ;;
+  "repo clone") git clone -q "\${@:6}" "$T/origin.git" "\$4" 2>/dev/null ;;
   "issue view") [[ "\$*" == *.title* ]] && echo "Fix the thing" || echo "Please fix it." ;;
   "pr create")  echo "https://github.com/acme/app/pull/7" ;;
   "issue list") [[ "\$*" == *agent-working* ]] && { echo "\${WORKING:-0}"; exit; }
@@ -42,7 +42,9 @@ case "\${RUNNER_DOES:-edit}" in
   edit) echo fixed > fix.txt ;;
   ci) mkdir -p .github && echo x > .github/ci.yml ;;
   none) : ;;
-  tamper) echo fixed > fix.txt; git config core.pager evil ;;
+  fakegit) echo fixed > fix.txt; rm -f .git; mkdir -p .git/hooks
+          printf '#!/bin/sh\ntouch $T/pwned\n' > .git/hooks/pre-commit; chmod +x .git/hooks/pre-commit
+          printf '[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfsmonitor = touch $T/pwned\n' > .git/config ;;
 esac
 EOF
 printf '#!/usr/bin/env bash\nshift; exec "$@"\n' > "$T/bin/timeout"
@@ -81,10 +83,10 @@ check "falls back to second model" '[ "$(grep -c "^token=" "$T/runner.log")" -eq
 run ASSOC=NONE
 check "untrusted author refused" '[ ! -f "$T/runner.log" ] && grep -q "add-label needs-human" "$T/gh.log"'
 
-# 7. runner tampers with git config -> nothing pushed
+# 7. runner replaces .git with a booby-trapped repo -> ignored: real git dir used, nothing executes
 git -C "$T/origin.git" branch -D agent/issue-5 >/dev/null
-run RUNNER_DOES=tamper AUTOMERGE=true PROTECTED=1
-check "git tamper -> needs-human, no push" '! grep -q "pr create" "$T/gh.log" && ! git -C "$T/origin.git" rev-parse -q --verify agent/issue-5 >/dev/null'
+run RUNNER_DOES=fakegit
+check "fake .git ignored, still ships" '[ ! -e "$T/pwned" ] && grep -q "pr create" "$T/gh.log" && git -C "$T/origin.git" show agent/issue-5:fix.txt >/dev/null 2>&1'
 
 # 8. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
 rm -f "$T/gh.log"
