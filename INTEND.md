@@ -15,7 +15,7 @@ agents do repo-level dev and tests.
 ## What we build (v1)
 
 ```
-GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──► OpenCode (worktree per issue)
+GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──► OpenCode (fresh clone per issue)
                      │                                          │
                      └──► needs-human                           ▼
                                                    PR ──► CI green ──► merge ──► CI/CD deploy
@@ -25,7 +25,7 @@ GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──�
 2. **Triage:** Hermes reads every new issue and labels it `agent-ready` or `needs-human`.
    - Humans can add or remove the label to override Hermes.
    - Only `agent-ready` issues are worked.
-3. **Execution:** Hermes dispatches each `agent-ready` issue to **OpenCode** headless, in its own git worktree.
+3. **Execution:** Hermes dispatches each `agent-ready` issue to **OpenCode** headless, in its own throwaway clone.
 4. **Delivery:** OpenCode branches, commits, pushes and opens a PR that links the issue.
    - Once CI is green, the agent may merge.
    - The deploy then happens through the existing CI/CD pipeline.
@@ -49,7 +49,7 @@ GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──�
 | Model (Hermes + OpenCode) | `opencode/longcat-2.5-preview-free` via OpenCode Zen. Fallback: `opencode/nemotron-3-ultra-free` |
 | Intake | GitHub Issues |
 | Identity | Dedicated GitHub bot account, fine-grained PAT scoped to the target repo |
-| Isolation | One git worktree per issue on the VPS host |
+| Isolation | One throwaway git clone per issue on the VPS host (separate unix user: pending) |
 | Target repo | **TBD**: named after setup |
 
 The free preview model is accepted for the pilot only. Its data policy, rate limits and availability are

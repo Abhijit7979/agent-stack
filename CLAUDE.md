@@ -14,7 +14,7 @@ hermes_agent/
     ├── config/stack.env         # THE config: repo, runner, models, limits, merge mode
     ├── scripts/triage-feed.sh   # pre-run script for the triage cron job (untriaged issues → prompt)
     ├── scripts/dispatch.sh      # no-agent cron job: agent-ready → agent-working, launches workers
-    ├── scripts/work-issue.sh    # one issue: worktree → runner → PR → auto-merge (guardrails live here)
+    ├── scripts/work-issue.sh    # one issue: fresh clone → runner → PR → auto-merge (guardrails live here)
     ├── skills/issue-triage/     # Hermes skill: label agent-ready / needs-human
     ├── deploy/install.sh        # VPS install (copies into ~/.hermes, sets model, labels, cron jobs)
     └── tests/test_pipeline.sh   # offline check, stubbed gh/opencode — run after any script change
@@ -46,14 +46,13 @@ Hermes already ships most of what we need. Look there before writing anything:
 | Task board / dispatch | `hermes_cli/kanban*.py`, `tools/kanban_tools.py`, `gateway/kanban_watchers*.py` |
 | Scheduling / polling | `cron/`, `tools/cronjob_tools.py` |
 | GitHub | `skills/software-development/github/`, `hermes_cli/github_api.py` |
-| Worktree cleanup | `hermes worktree` |
 | Fallback model | `hermes fallback` |
 | Config defaults | `hermes_cli/config_defaults.py`, `cli-config.yaml.example`; user config is `~/.hermes/config.yaml` |
 
 ## Key commands
 
-- Run OpenCode headless in a worktree:
-  `opencode run --dir <worktree> -m opencode/longcat-2.5-preview-free "<task>"`
+- Run OpenCode headless in a checkout:
+  `opencode run --dir <checkout> -m opencode/longcat-2.5-preview-free "<task>"`
 - Run Hermes once, non-interactively: `hermes -z "<prompt>"`
 - The model is `opencode/longcat-2.5-preview-free`, and the fallback is `opencode/nemotron-3-ultra-free`.
   - Both are set in **one place** in `stack/config/`.

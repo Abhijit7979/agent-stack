@@ -59,7 +59,7 @@ check "opens PR" 'grep -q "pr create" "$T/gh.log"'
 check "auto-merge on" 'grep -q "pr merge .* --auto" "$T/gh.log"'
 check "labels agent-pr" 'grep -q "add-label agent-pr" "$T/gh.log"'
 check "runner never sees GH_TOKEN" 'grep -q "token=none" "$T/runner.log"'
-check "worktree cleaned" '[ ! -d "$T/work/wt/5" ]'
+check "workspace cleaned" '[ ! -d "$T/work/wt/5" ]'
 
 # 2. no branch protection -> PR only
 run AUTOMERGE=true
@@ -85,7 +85,6 @@ check "untrusted author refused" '[ ! -f "$T/runner.log" ] && grep -q "add-label
 git -C "$T/origin.git" branch -D agent/issue-5 >/dev/null
 run RUNNER_DOES=tamper AUTOMERGE=true PROTECTED=1
 check "git tamper -> needs-human, no push" '! grep -q "pr create" "$T/gh.log" && ! git -C "$T/origin.git" rev-parse -q --verify agent/issue-5 >/dev/null'
-git -C "$T/work/repo" config --unset core.pager || true
 
 # 8. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
 rm -f "$T/gh.log"

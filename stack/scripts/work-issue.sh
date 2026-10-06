@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Work one GitHub issue end to end: worktree -> runner -> commit -> PR -> (auto-merge).
+# Work one GitHub issue end to end: fresh clone -> runner -> commit -> PR -> (auto-merge).
 # Usage: work-issue.sh <issue-number>. Launched by dispatch.sh, which already set label agent-working.
 # Guardrails are enforced here in code, not in the runner prompt (INTEND.md "hard guardrails").
 set -euo pipefail
@@ -8,7 +8,6 @@ source "$HERE/stack.env"
 
 N="$1"
 BRANCH="agent/issue-$N"
-CLONE="$WORK_ROOT/repo"
 WT="$WORK_ROOT/wt/$N"
 
 fail() {
@@ -16,7 +15,7 @@ fail() {
   gh issue edit "$N" -R "$REPO" --remove-label agent-working --add-label needs-human || true
   exit 1
 }
-cleanup() { git -C "$CLONE" worktree remove --force "$WT" 2>/dev/null || true; }
+cleanup() { rm -rf "$WT"; }
 trap cleanup EXIT
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
@@ -24,12 +23,10 @@ trap 'fail "unexpected error (line $LINENO)"' ERR
 ASSOC="$(gh api "repos/$REPO/issues/$N" --jq .author_association)"
 case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a repo collaborator ($ASSOC)" ;; esac
 
-# --- workspace: one shared clone, one worktree per issue ---
-[ -d "$CLONE/.git" ] || gh repo clone "$REPO" "$CLONE"
-git -C "$CLONE" fetch -q origin "$BASE_BRANCH"
-git -C "$CLONE" worktree remove --force "$WT" 2>/dev/null || true
-git -C "$CLONE" branch -D "$BRANCH" 2>/dev/null || true
-git -C "$CLONE" worktree add -q -b "$BRANCH" "$WT" "origin/$BASE_BRANCH"
+# --- workspace: throwaway clone per issue, so nothing the runner leaves behind outlives the task ---
+rm -rf "$WT"
+gh repo clone "$REPO" "$WT" -- -q --depth 1 -b "$BASE_BRANCH"
+git -C "$WT" checkout -q -b "$BRANCH"
 
 TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
@@ -49,8 +46,9 @@ Rules:
 - If the issue is unclear or unsafe to do, change nothing."
 
 # --- run the coding agent; GitHub token is stripped so it cannot push/merge on its own ---
-# ponytail: runner runs as our own unix user, so it could still read ~/.hermes/.env. Real fix is a
-# separate unprivileged user or a container per task (INTEND "Later"); required before untrusted repos.
+# ponytail: runner runs as our own unix user, so it could still read ~/.hermes/.env or shadow `gh`
+# on PATH. These git checks are defence in depth only; the real fix is a separate unprivileged user
+# or a container per task — required before pointing this at a company repo.
 run_runner() {  # $1 = model, $2 = seconds
   case "$RUNNER" in
     opencode) (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN timeout "$2" opencode run -m "$1" "$PROMPT") ;;
@@ -58,9 +56,12 @@ run_runner() {  # $1 = model, $2 = seconds
   esac
 }
 # Fingerprint git config/hooks the runner could tamper with to run code under our GH_TOKEN later.
-gitstate() { cat "$CLONE/.git/config" "$WT/.git"; ls -la "$CLONE/.git/hooks"; }
+gitstate() { cat "$WT/.git/config"; ls -la "$WT/.git/hooks"; }
 before="$(gitstate | cksum)"
-SAFE_GIT=(git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WT")  # every git call after the runner
+# Every git call after the runner: ignore user/system config (runner could edit ~/.gitconfig), no hooks,
+# no fsmonitor; push auth comes explicitly from gh.
+SAFE_GIT=(env GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 git -c core.hooksPath=/dev/null
+  -c core.fsmonitor=false -c credential.helper= -c "credential.helper=!gh auth git-credential" -C "$WT")
 trap - ERR
 deadline=$((SECONDS + TASK_TIMEOUT)); used="$MODEL"
 for model in "$MODEL" "$FALLBACK_MODEL"; do
