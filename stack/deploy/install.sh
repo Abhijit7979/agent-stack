@@ -30,9 +30,9 @@ gh label create agent-working -R "$REPO" --color FBCA04 --force --description "A
 gh label create agent-pr      -R "$REPO" --color 1D76DB --force --description "Agent opened a PR"
 
 # 4. Cron jobs (run inside the Hermes gateway).
-jobs="$(hermes cron list 2>/dev/null || true)"
+jobs="$(cat "$HH/cron/jobs.json" 2>/dev/null || true)"
 grep -q agent-triage <<<"$jobs" || hermes cron create "every 10m" \
-  "Triage the untriaged issues listed above for $REPO using the issue-triage skill." \
+  "Triage the untriaged issues listed in this message for $REPO using the issue-triage skill." \
   --skill issue-triage --script triage-feed.sh --name agent-triage
 grep -q agent-dispatch <<<"$jobs" || hermes cron create "every 5m" \
   --no-agent --script dispatch.sh --name agent-dispatch
@@ -44,7 +44,7 @@ Installed. Manual steps left (secrets are never handled by this script):
      PAT scope: only $REPO — Contents RW, Pull requests RW, Issues RW, Metadata R,
      Administration R (readiness gate reads branch protection). NO Workflows permission.
   2. In $HH/config.yaml add:   terminal: { env_passthrough: [GH_TOKEN] }
-  3. Log OpenCode in for headless runs:  opencode auth login   (verify: opencode models | grep longcat)
+  3. Verify headless OpenCode:  cd /tmp && opencode run -m $MODEL "reply with just: ok"
   4. Branch protection on $BASE_BRANCH with required CI checks + repo "Allow auto-merge",
      otherwise the stack stays PR-only (readiness gate).
   5. Run Hermes as a boot service:  sudo hermes gateway install --system

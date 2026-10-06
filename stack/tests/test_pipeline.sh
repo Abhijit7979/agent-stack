@@ -25,17 +25,24 @@ case "\$1 \$2" in
   "repo clone") git clone -q "$T/origin.git" "\$4" ;;
   "issue view") [[ "\$*" == *.title* ]] && echo "Fix the thing" || echo "Please fix it." ;;
   "pr create")  echo "https://github.com/acme/app/pull/7" ;;
-  "issue list") [[ "\$*" == *agent-working* ]] && echo "\${WORKING:-0}" || printf '11\n12\n13\n' ;;
-  api*) [[ "\$*" == *protection* ]] && { [ -n "\${PROTECTED:-}" ] && echo 1 || exit 1; } || echo "\${AUTOMERGE:-false}" ;;
+  "issue list") [[ "\$*" == *agent-working* ]] && { echo "\${WORKING:-0}"; exit; }
+                q="\${@: -1}"; echo '[{"number":13,"createdAt":"3"},{"number":11,"createdAt":"1"},{"number":12,"createdAt":"2"}]' | jq -r "\$q" ;;
+  api*) case "\$*" in
+          *protection*) [ -n "\${PROTECTED:-}" ] && echo 1 || exit 1 ;;
+          *issues/*)    echo "\${ASSOC:-COLLABORATOR}" ;;
+          *)            echo "\${AUTOMERGE:-false}" ;;
+        esac ;;
 esac
 EOF
 cat > "$T/bin/opencode" <<EOF
 #!/usr/bin/env bash
-echo "token=\${GH_TOKEN:-none}" >> "$T/runner.log"
+echo "token=\${GH_TOKEN:-none} \$*" >> "$T/runner.log"
+[ -n "\${PRIMARY_FAILS:-}" ] && [[ "\$*" == *longcat* ]] && exit 1
 case "\${RUNNER_DOES:-edit}" in
   edit) echo fixed > fix.txt ;;
   ci) mkdir -p .github && echo x > .github/ci.yml ;;
   none) : ;;
+  tamper) echo fixed > fix.txt; git config core.pager evil ;;
 esac
 EOF
 printf '#!/usr/bin/env bash\nshift; exec "$@"\n' > "$T/bin/timeout"
@@ -66,7 +73,21 @@ check "no-change -> needs-human" 'grep -q "add-label needs-human" "$T/gh.log" &&
 run RUNNER_DOES=ci AUTOMERGE=true PROTECTED=1
 check "protected path -> needs-human" 'grep -q "add-label needs-human" "$T/gh.log" && ! grep -q "pr create" "$T/gh.log"'
 
-# 5. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
+# 5. primary model fails with no changes -> fallback model runs
+run PRIMARY_FAILS=1
+check "falls back to second model" '[ "$(grep -c "^token=" "$T/runner.log")" -eq 2 ] && grep -q "by opencode (opencode/nemotron" "$T/gh.log"'
+
+# 6. issue from a non-collaborator -> refused before the runner starts
+run ASSOC=NONE
+check "untrusted author refused" '[ ! -f "$T/runner.log" ] && grep -q "add-label needs-human" "$T/gh.log"'
+
+# 7. runner tampers with git config -> nothing pushed
+git -C "$T/origin.git" branch -D agent/issue-5 >/dev/null
+run RUNNER_DOES=tamper AUTOMERGE=true PROTECTED=1
+check "git tamper -> needs-human, no push" '! grep -q "pr create" "$T/gh.log" && ! git -C "$T/origin.git" rev-parse -q --verify agent/issue-5 >/dev/null'
+git -C "$T/work/repo" config --unset core.pager || true
+
+# 8. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
 rm -f "$T/gh.log"
 out="$(WORKING=1 RUNNER_DOES=none "$T/scripts/dispatch.sh")"; sleep 1
 check "dispatch respects MAX_PARALLEL" '[ "$out" = "Dispatched #11 to opencode" ]'

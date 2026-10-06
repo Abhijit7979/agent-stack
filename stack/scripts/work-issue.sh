@@ -20,6 +20,10 @@ cleanup() { git -C "$CLONE" worktree remove --force "$WT" 2>/dev/null || true; }
 trap cleanup EXIT
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
+# --- trust gate: only issues opened by owners/members/collaborators (issue text becomes the prompt) ---
+ASSOC="$(gh api "repos/$REPO/issues/$N" --jq .author_association)"
+case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a repo collaborator ($ASSOC)" ;; esac
+
 # --- workspace: one shared clone, one worktree per issue ---
 [ -d "$CLONE/.git" ] || gh repo clone "$REPO" "$CLONE"
 git -C "$CLONE" fetch -q origin "$BASE_BRANCH"
@@ -31,9 +35,11 @@ TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
 PROMPT="Resolve GitHub issue #$N in this repository.
 
+<issue>
 Title: $TITLE
 
 $BODY
+</issue>
 
 Rules:
 - Make the smallest change that fully resolves the issue. Add or update tests for it.
@@ -43,35 +49,43 @@ Rules:
 - If the issue is unclear or unsafe to do, change nothing."
 
 # --- run the coding agent; GitHub token is stripped so it cannot push/merge on its own ---
+# ponytail: runner runs as our own unix user, so it could still read ~/.hermes/.env. Real fix is a
+# separate unprivileged user or a container per task (INTEND "Later"); required before untrusted repos.
 run_runner() {  # $1 = model, $2 = seconds
   case "$RUNNER" in
     opencode) (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN timeout "$2" opencode run -m "$1" "$PROMPT") ;;
     *) echo "unknown RUNNER=$RUNNER" >&2; return 2 ;;
   esac
 }
+# Fingerprint git config/hooks the runner could tamper with to run code under our GH_TOKEN later.
+gitstate() { cat "$CLONE/.git/config" "$WT/.git"; ls -la "$CLONE/.git/hooks"; }
+before="$(gitstate | cksum)"
+SAFE_GIT=(git -c core.hooksPath=/dev/null -c core.fsmonitor=false -C "$WT")  # every git call after the runner
 trap - ERR
-deadline=$((SECONDS + TASK_TIMEOUT))
+deadline=$((SECONDS + TASK_TIMEOUT)); used="$MODEL"
 for model in "$MODEL" "$FALLBACK_MODEL"; do
   left=$((deadline - SECONDS)); [ "$left" -gt 60 ] || break
+  used="$model"
   run_runner "$model" "$left" && break
-  [ -n "$(git -C "$WT" status --porcelain)" ] && break  # partial work exists; don't restart from a second model
+  [ -n "$("${SAFE_GIT[@]}" status --porcelain)" ] && break  # partial work exists; don't restart from a second model
 done
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
-git -C "$WT" add -A
-CHANGED="$(git -C "$WT" diff --cached --name-only)"
+[ "$(gitstate | cksum)" = "$before" ] || fail "the coding agent modified git config or hooks"
+"${SAFE_GIT[@]}" add -A
+CHANGED="$("${SAFE_GIT[@]}" diff --cached --name-only)"
 [ -n "$CHANGED" ] || fail "the coding agent produced no changes (or ran out of its $((TASK_TIMEOUT / 60))-minute budget)"
 if echo "$CHANGED" | grep -Eq "$PROTECTED_PATHS"; then
   fail "the change touches protected paths ($(echo "$CHANGED" | grep -E "$PROTECTED_PATHS" | tr '\n' ' '))"
 fi
 
-git -C "$WT" -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -q -m "$TITLE (#$N)"
-git -C "$WT" push -q -f -u origin "$BRANCH"  # ponytail: -f only ever on our own agent/issue-N branch, never base
+"${SAFE_GIT[@]}" -c user.name="$BOT_NAME" -c user.email="$BOT_EMAIL" commit -q -m "$TITLE (#$N)"
+"${SAFE_GIT[@]}" push -q -f -u origin "$BRANCH"  # ponytail: -f only ever on our own agent/issue-N branch, never base
 
 PR_URL="$(gh pr create -R "$REPO" --base "$BASE_BRANCH" --head "$BRANCH" --title "$TITLE" \
   --body "Closes #$N
 
-Automated change by $RUNNER ($MODEL). Revert with: \`git revert -m 1 <merge-sha>\`.")"
+Automated change by $RUNNER ($used). Revert with: \`git revert -m 1 <merge-sha>\`.")"
 
 # --- readiness gate: auto-merge only with auto-merge enabled + required checks on base ---
 ready() {

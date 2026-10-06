@@ -14,7 +14,7 @@ slots=$((MAX_PARALLEL - working))
 [ "$slots" -gt 0 ] || exit 0
 
 gh issue list -R "$REPO" --state open --label agent-ready --json number,createdAt \
-  --jq 'sort_by(.createdAt) | .[].number' | head -n "$slots" | while read -r n; do
+  --jq "sort_by(.createdAt) | .[:$slots] | .[].number" | while read -r n; do
   # Claim before launching so the next tick can't double-dispatch.
   gh issue edit "$n" -R "$REPO" --remove-label agent-ready --add-label agent-working >/dev/null
   setsid nohup "$HERE/work-issue.sh" "$n" >>"$WORK_ROOT/logs/issue-$n.log" 2>&1 </dev/null &
