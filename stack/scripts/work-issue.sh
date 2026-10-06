@@ -8,7 +8,7 @@ source "$HERE/stack.env"
 
 N="$1"
 BRANCH="agent/issue-$N"
-WT="$WORK_ROOT/wt/$N"   # work tree: shared with RUNNER_USER via the setgid group on wt/
+WT="$WORK_ROOT/wt/$N"   # work tree: writable by this task's runner user only (ACL)
 GD="$WORK_ROOT/git/$N"  # git metadata: hermes-only, the runner can't read or replace it
 
 fail() {
@@ -16,8 +16,13 @@ fail() {
   gh issue edit "$N" -R "$REPO" --remove-label agent-working --add-label needs-human || true
   exit 1
 }
+U=""                    # runner unix user for this task (one per slot)
+# Kill anything the runner left running, wipe its home (no state carries to the next task), drop the tree.
 cleanup() {
-  [ -z "${RUNNER_USER:-}" ] || sudo -n -u "$RUNNER_USER" -- rm -rf "$WT" 2>/dev/null || true  # runner-owned files
+  if [ -n "$U" ]; then
+    sudo -n -u "$U" -- sh -c 'kill -9 -1' 2>/dev/null || true  # builtin kill; procps kill rejects -1
+    sudo -n -u "$U" -H -- sh -c 'find "$HOME" -mindepth 1 -delete; rm -rf "$0"' "$WT" 2>/dev/null || true
+  fi
   rm -rf "$WT" "$GD"
 }
 trap cleanup EXIT
@@ -27,11 +32,21 @@ trap 'fail "unexpected error (line $LINENO)"' ERR
 ASSOC="$(gh api "repos/$REPO/issues/$N" --jq .author_association)"
 case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a repo collaborator ($ASSOC)" ;; esac
 
+# --- runner slot: a dedicated unix user per in-flight task, so parallel tasks can't touch each other.
+# The flock is held (fd 9) until this script exits.
+mkdir -p "$WORK_ROOT/wt"; [ -d "$WORK_ROOT/git" ] || mkdir -m 700 "$WORK_ROOT/git"
+for u in ${RUNNER_USERS:-}; do
+  exec 9>"$WORK_ROOT/git/slot-$u.lock"
+  if flock -n 9; then U="$u"; break; fi
+done
+[ -z "${RUNNER_USERS:-}" ] || [ -n "$U" ] || fail "no free runner slot"
+
 # --- workspace: throwaway clone per issue, so nothing the runner leaves behind outlives the task ---
 cleanup
-mkdir -p "$WORK_ROOT/wt"; [ -d "$WORK_ROOT/git" ] || mkdir -m 700 "$WORK_ROOT/git"
-(umask 002 && gh repo clone "$REPO" "$WT" -- -q --separate-git-dir "$GD" --depth 1 -b "$BASE_BRANCH")
+gh repo clone "$REPO" "$WT" -- -q --separate-git-dir "$GD" --depth 1 -b "$BASE_BRANCH"
 git -C "$WT" checkout -q -b "$BRANCH"
+chmod 700 "$WT"  # other slot users can't even read it
+[ -z "$U" ] || setfacl -R -m "u:$U:rwX,d:u:$U:rwX,d:u:$(id -un):rwX" "$WT"  # + we can read what it creates
 
 TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
@@ -50,11 +65,11 @@ Rules:
 - Do not edit CI config (.github/), .env files, or anything holding secrets.
 - If the issue is unclear or unsafe to do, change nothing."
 
-# --- run the coding agent as RUNNER_USER: sudo resets the env (no GH_TOKEN) and that user can't
-# read $HERMES_HOME. Empty RUNNER_USER = same user, token merely stripped (local tests only).
+# --- run the coding agent as the slot user: sudo resets the env (no GH_TOKEN) and that user can't
+# read $HERMES_HOME. No RUNNER_USERS = same user, token merely stripped (local tests only).
 as_runner() {
-  if [ -n "${RUNNER_USER:-}" ]; then
-    sudo -n -u "$RUNNER_USER" -H -- sh -c 'umask 002; cd "$0" && exec "$@"' "$WT" "$@"  # env reset by sudo
+  if [ -n "$U" ]; then
+    sudo -n -u "$U" -H -- sh -c 'cd "$0" && exec "$@"' "$WT" "$@"
   else
     (cd "$WT" && env -u GH_TOKEN -u GITHUB_TOKEN "$@")
   fi

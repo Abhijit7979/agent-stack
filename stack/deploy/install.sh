@@ -6,7 +6,7 @@ STACK="$(cd "$(dirname "$0")/.." && pwd)"
 HH="${HERMES_HOME:-$HOME/.hermes}"
 source "$STACK/config/stack.env"
 
-for bin in hermes opencode gh git timeout setsid; do
+for bin in hermes opencode gh git timeout setsid flock setfacl; do
   command -v "$bin" >/dev/null || { echo "missing: $bin" >&2; exit 1; }
 done
 [ "$REPO" != "OWNER/REPO" ] || { echo "set REPO in stack/config/stack.env first" >&2; exit 1; }
@@ -20,7 +20,7 @@ rm -rf "$HH/skills/issue-triage" && cp -r "$STACK/skills/issue-triage" "$HH/skil
 # 2. Hermes's own model: NOT set here. OpenCode's free tier only works from inside OpenCode
 #    ("FreeTierError"), so Hermes needs its own provider — configure with `hermes model`.
 mkdir -p "$WORK_ROOT/wt" "$WORK_ROOT/logs"
-[ -z "${RUNNER_USER:-}" ] || sudo -n -u "$RUNNER_USER" true || { echo "cannot sudo to $RUNNER_USER" >&2; exit 1; }
+for u in ${RUNNER_USERS:-}; do sudo -n -u "$u" true || { echo "cannot sudo to $u" >&2; exit 1; }; done
 
 # 3. GitHub: git pushes via gh's token; labels the pipeline uses.
 gh auth setup-git
