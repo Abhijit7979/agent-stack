@@ -50,7 +50,7 @@ GitHub Issue ──► Hermes (triage) ──label──► agent-ready ──�
 | Intake | GitHub Issues |
 | Identity | Dedicated GitHub bot account, fine-grained PAT scoped to the target repo |
 | Isolation | One throwaway git clone per issue on the VPS host (separate unix user: pending) |
-| Target repo | **TBD**: named after setup |
+| Target repo | `Abhijit7979/testing-my-agent-layer` (private sandbox: Python + pytest + CI) |
 
 The free preview model is accepted for the pilot only. Its data policy, rate limits and availability are
 known risks.
@@ -105,6 +105,6 @@ Deadline: 2 weeks from the start, with the metrics above being tracked.
 
 ## Open items
 
-- [ ] Name the target repo and confirm it passes the readiness gate.
+- [x] Name the target repo and confirm it passes the readiness gate (CI `test` required, auto-merge on).
 - [ ] Create the bot account and PAT, and set up branch protection.
 - [ ] Provision Hermes and OpenCode on the VPS.
