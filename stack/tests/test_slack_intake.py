@@ -83,6 +83,31 @@ class IntakeTest(unittest.TestCase):
         self.assertEqual(send.call_args.args[0].full_url,
                          "https://api.github.com/repos/acme/other")
 
+    def test_spoken_repo_name_must_resolve_uniquely(self):
+        self.assertEqual(intake.repo_hint("in theastraveda website repo, update README"),
+                         "theastraveda website")
+        self.assertEqual(intake.repo_hint("It's in Astra Veda website repo, not here"),
+                         "Astra Veda website")
+        self.assertIsNone(intake.repo_hint("in this repo, update README"))
+        repos = io.BytesIO(json.dumps([
+            {"full_name": "Abhijit7979/theastraveda_website"},
+            {"full_name": "Abhijit7979/testing-my-agent-layer"},
+        ]).encode())
+        with patch.object(intake.urllib.request, "urlopen", return_value=repos) as send:
+            self.assertEqual(intake.resolve_repo_hint("Astra Veda website", "secret"),
+                             "Abhijit7979/theastraveda_website")
+        self.assertIn("/user/repos?", send.call_args.args[0].full_url)
+        with patch.object(intake.urllib.request, "urlopen", return_value=io.BytesIO(b"[]")):
+            with self.assertRaisesRegex(ValueError, "GitHub URL"):
+                intake.resolve_repo_hint("unknown repo", "secret")
+        ambiguous = io.BytesIO(json.dumps([
+            {"full_name": "Abhijit7979/astraveda_website"},
+            {"full_name": "Abhijit7979/astra-veda-app"},
+        ]).encode())
+        with patch.object(intake.urllib.request, "urlopen", return_value=ambiguous):
+            with self.assertRaisesRegex(ValueError, "GitHub URL"):
+                intake.resolve_repo_hint("Astra Veda", "secret")
+
     def test_explicit_development_labels_issue_and_dispatches_without_slack_tokens(self):
         self.assertTrue(intake.DEVELOP.match("Can you build a home page?"))
         self.assertFalse(intake.DEVELOP.match("How do I build a home page?"))
@@ -118,6 +143,8 @@ class IntakeTest(unittest.TestCase):
         self.assertFalse(intake.workspace_member({"user": "U1", "team": "T1"}, client, "T2"))
         external = types.SimpleNamespace(users_info=lambda user: {"user": {"team_id": "EXT"}})
         self.assertFalse(intake.workspace_member({"user": "U1"}, external, "T1"))
+        with patch.object(intake, "github_get", return_value={"state": "closed", "labels": [{"name": "agent-pr"}]}):
+            self.assertEqual(intake.queue_issue("acme/app", "secret", 2), "pr")
 
     def test_status_posts_once_to_original_thread(self):
         with tempfile.TemporaryDirectory() as directory, \
@@ -264,7 +291,7 @@ class IntakeTest(unittest.TestCase):
             dispatch.assert_called_once_with(2, "acme/other")
             self.assertIn("Queued development", say.call_args.args[0])
 
-            # The remaining checks use the default repository, not this thread's context.
+            # A thread without repo context must not silently use the default repository.
             with closing(sqlite3.connect(intake.STATE)) as con:
                 con.execute("DELETE FROM thread_repos")
                 con.commit()
@@ -278,16 +305,17 @@ class IntakeTest(unittest.TestCase):
                  patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
                 handler(development, say)
                 handler(development, say)
-            create.assert_called_once()
-            self.assertEqual(create.call_args.kwargs["label"], "agent-ready")
-            dispatch.assert_called_once_with(2, "acme/app")
-            self.assertEqual(say.call_count, 1)
+            create.assert_not_called()
+            dispatch.assert_not_called()
+            self.assertEqual(say.call_count, 2)
+            self.assertIn("URL", say.call_args.args[0])
             self.assertEqual(say.call_args.kwargs["thread_ts"], "100.1")
 
             # A lost GitHub POST response is uncertain: do not POST again on Slack retry.
             say.reset_mock(side_effect=True)
             uncertain = {"channel": "C123", "ts": "106.1", "thread_ts": "100.1",
-                         "text": "create issue: Fix signup", "team": "T1", "user": "U1"}
+                         "text": "https://github.com/acme/app\ncreate issue: Fix signup",
+                         "team": "T1", "user": "U1"}
             post_attempts = []
 
             def lost_response(request, timeout):
@@ -308,7 +336,8 @@ class IntakeTest(unittest.TestCase):
             say.reset_mock(side_effect=True)
             say.side_effect = [RuntimeError("send failed"), None]
             issue = {"channel": "C123", "ts": "105.1", "thread_ts": "100.1",
-                     "text": "create issue: Fix login", "team": "T1", "user": "U1"}
+                     "text": "https://github.com/acme/app\ncreate issue: Fix login",
+                     "team": "T1", "user": "U1"}
             with patch.object(intake, "ensure_agent_labels"), \
                  patch.object(intake, "dispatch_ready", return_value=True), \
                  patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/1", True)) as create:
@@ -342,6 +371,221 @@ class IntakeTest(unittest.TestCase):
         self.assertNotIn("bot-secret", repr(run.call_args))
         self.assertNotIn("app-secret", repr(run.call_args))
         self.assertEqual(run.call_args.kwargs["env"]["OPENROUTER_API_KEY"], "router-secret")
+        with patch.dict(intake.os.environ, {"OPENROUTER_API_KEY": "router-secret"}), \
+             patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess(
+                 [], 0, "<|tool_call_start|>[read_file(path='/tmp/README.md')]<|tool_call_end|>", "")):
+            self.assertNotIn("tool_call", intake.assistant_reply("show the README", "model"))
+
+    def test_spoken_repo_task_and_generic_follow_up(self):
+        root = {"channel": "C1", "ts": "100.1", "team": "T1", "user": "U1",
+                "text": "<@UBOT> in theastraveda website repo, in readme file add which agent skills are used"}
+
+        class FakeApp:
+            instance = None
+
+            def __init__(self, token):
+                self.client = types.SimpleNamespace(
+                    auth_test=lambda: {"user_id": "UBOT", "team_id": "T1"},
+                    users_info=lambda user: {"user": {"team_id": "T1"}},
+                    conversations_replies=lambda **kwargs: {"messages": [root]},
+                )
+                self.handlers = {}
+                FakeApp.instance = self
+
+            def event(self, name):
+                return lambda handler: self.handlers.setdefault(name, handler)
+
+        bolt = types.ModuleType("slack_bolt")
+        bolt.App = FakeApp
+        adapter = types.ModuleType("slack_bolt.adapter")
+        socket_mode = types.ModuleType("slack_bolt.adapter.socket_mode")
+        socket_mode.SocketModeHandler = lambda app, token: types.SimpleNamespace(start=lambda: None)
+        say = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(sys.modules, {"slack_bolt": bolt, "slack_bolt.adapter": adapter,
+                                      "slack_bolt.adapter.socket_mode": socket_mode}), \
+             patch.dict(intake.os.environ, {"SLACK_BOT_TOKEN": "bot", "SLACK_APP_TOKEN": "app",
+                                         "GH_TOKEN": "gh", "REPO": "Abhijit7979/testing-my-agent-layer"}), \
+             patch.object(intake, "STATE", Path(directory) / "state.db"), \
+             patch.object(intake, "resolve_repo_hint", return_value="Abhijit7979/theastraveda_website"), \
+             patch.object(intake, "github_get", return_value={"permissions": {"push": True}, "has_issues": True}), \
+             patch.object(intake, "create_issue", return_value=(
+                 "https://github.com/Abhijit7979/theastraveda_website/issues/3", True)) as create, \
+             patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
+            intake.main()
+            handler = FakeApp.instance.handlers["message"]
+            handler(root, say)
+            self.assertEqual(create.call_args.args[0], "Abhijit7979/theastraveda_website")
+            dispatch.assert_called_once_with(3, "Abhijit7979/theastraveda_website")
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                self.assertEqual(intake.saved_repo(con, "C1", "100.1"),
+                                 "Abhijit7979/theastraveda_website")
+            follow_up = {"channel": "C1", "ts": "101.1", "thread_ts": "100.1", "team": "T1",
+                         "user": "U1", "text": "Create a issue and solve it"}
+            with patch.object(intake, "queue_issue", return_value="working"):
+                handler(follow_up, say)
+            create.assert_called_once()
+            self.assertIn("already running", say.call_args.args[0])
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                intake.remember_issue(con, "C1", "100.1",
+                                      "https://github.com/Abhijit7979/testing-my-agent-layer/issues/8")
+            handler({**follow_up, "ts": "102.1"}, say)
+            self.assertEqual(create.call_count, 2)
+            self.assertEqual(create.call_args.args[0], "Abhijit7979/theastraveda_website")
+            self.assertIn("readme file add", create.call_args.args[2])
+
+    def test_issue_write_requires_an_unambiguous_repo(self):
+        class FakeApp:
+            instance = None
+
+            def __init__(self, token):
+                self.client = types.SimpleNamespace(
+                    auth_test=lambda: {"user_id": "UBOT", "team_id": "T1"},
+                    users_info=lambda user: {"user": {"team_id": "T1"}},
+                    conversations_replies=lambda **kwargs: {"messages": []},
+                )
+                self.handlers = {}
+                FakeApp.instance = self
+
+            def event(self, name):
+                return lambda handler: self.handlers.setdefault(name, handler)
+
+        bolt = types.ModuleType("slack_bolt")
+        bolt.App = FakeApp
+        adapter = types.ModuleType("slack_bolt.adapter")
+        socket_mode = types.ModuleType("slack_bolt.adapter.socket_mode")
+        socket_mode.SocketModeHandler = lambda app, token: types.SimpleNamespace(start=lambda: None)
+        say = Mock()
+        default_repo = "Abhijit7979/testing-my-agent-layer"
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(sys.modules, {"slack_bolt": bolt, "slack_bolt.adapter": adapter,
+                                      "slack_bolt.adapter.socket_mode": socket_mode}), \
+             patch.dict(intake.os.environ, {"SLACK_BOT_TOKEN": "bot", "SLACK_APP_TOKEN": "app",
+                                         "GH_TOKEN": "gh", "REPO": default_repo}), \
+             patch.object(intake, "STATE", Path(directory) / "state.db"), \
+             patch.object(intake, "create_issue", return_value=(
+                 f"https://github.com/{default_repo}/issues/10", True)) as create, \
+             patch.object(intake, "ensure_agent_labels"), \
+             patch.object(intake, "dispatch_ready", return_value=True):
+            intake.main()
+            handler = FakeApp.instance.handlers["message"]
+            for number, text in enumerate(("Create a issue and solve it", "Build a home page",
+                                           "Create issue: Fix README"), start=1):
+                handler({"channel": "C1", "ts": f"{number}.1", "team": "T1",
+                         "user": "U1", "text": f"<@UBOT> {text}"}, say)
+                self.assertIn("GitHub URL", say.call_args.args[0])
+            create.assert_not_called()
+
+            # The configured default is still valid when the user explicitly links it.
+            handler({"channel": "C1", "ts": "4.1", "team": "T1", "user": "U1",
+                     "text": (f"<@UBOT> https://github.com/{default_repo}\n"
+                              "Create issue: Fix README")}, say)
+            create.assert_called_once()
+            self.assertEqual(create.call_args.args[0], default_repo)
+
+            # A cached project is not sufficient when Slack cannot recover the thread.
+            create.reset_mock()
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                intake.saved_repo(con, "C2", "10.1")
+                intake.remember_repo(con, "C2", "10.1", default_repo)
+                intake.thread_engaged(con, "C2", "10.1")
+                intake.mark_thread_engaged(con, "C2", "10.1")
+            FakeApp.instance.client.conversations_replies = Mock(side_effect=RuntimeError("Slack unavailable"))
+            handler({"channel": "C2", "ts": "11.1", "thread_ts": "10.1", "team": "T1",
+                     "user": "U1", "text": "Create a issue and solve it"}, say)
+            create.assert_not_called()
+            self.assertIn("URL", say.call_args.args[0])
+
+            # Conflicting project references are a clarification, never a write.
+            FakeApp.instance.client.conversations_replies = lambda **kwargs: {"messages": []}
+            with patch.object(intake, "resolve_repo_hint", return_value="Abhijit7979/theastraveda_website"), \
+                 patch.object(intake, "github_get", return_value={"permissions": {"push": True},
+                                                                "has_issues": True}):
+                handler({"channel": "C3", "ts": "20.1", "team": "T1", "user": "U1",
+                         "text": ("<@UBOT> in Astra Veda website repo, "
+                                  "https://github.com/acme/other\ncreate issue: Fix README")}, say)
+            create.assert_not_called()
+            self.assertIn("URL", say.call_args.args[0])
+
+    def test_correction_in_thread_overrides_stale_project_and_hides_tool_tags(self):
+        target_repo = "Abhijit7979/theastraveda_website"
+        default_repo = "Abhijit7979/testing-my-agent-layer"
+        root = {"channel": "C1", "ts": "100.1", "team": "T1", "user": "U1",
+                "text": "<@UBOT> in theastraveda website repo, add agent skills used to README"}
+        correction = {"channel": "C1", "ts": "101.1", "thread_ts": "100.1", "team": "T1",
+                      "user": "U1", "text": "It's in Astra Veda website repo, not here"}
+
+        class FakeApp:
+            instance = None
+
+            def __init__(self, token):
+                self.client = types.SimpleNamespace(
+                    auth_test=lambda: {"user_id": "UBOT", "team_id": "T1"},
+                    users_info=lambda user: {"user": {"team_id": "T1"}},
+                    conversations_replies=lambda **kwargs: {"messages": [root, correction]},
+                )
+                self.handlers = {}
+                FakeApp.instance = self
+
+            def event(self, name):
+                return lambda handler: self.handlers.setdefault(name, handler)
+
+        bolt = types.ModuleType("slack_bolt")
+        bolt.App = FakeApp
+        adapter = types.ModuleType("slack_bolt.adapter")
+        socket_mode = types.ModuleType("slack_bolt.adapter.socket_mode")
+        socket_mode.SocketModeHandler = lambda app, token: types.SimpleNamespace(start=lambda: None)
+        say = Mock()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.dict(sys.modules, {"slack_bolt": bolt, "slack_bolt.adapter": adapter,
+                                      "slack_bolt.adapter.socket_mode": socket_mode}), \
+             patch.dict(intake.os.environ, {"SLACK_BOT_TOKEN": "bot", "SLACK_APP_TOKEN": "app",
+                                         "GH_TOKEN": "gh", "REPO": default_repo,
+                                         "OPENROUTER_API_KEY": "model-key"}), \
+             patch.object(intake, "STATE", Path(directory) / "state.db"), \
+             patch.object(intake, "resolve_repo_hint", return_value=target_repo), \
+             patch.object(intake, "github_get", return_value={"permissions": {"push": True},
+                                                            "has_issues": True}), \
+             patch.object(intake, "create_issue", return_value=(
+                 f"https://github.com/{target_repo}/issues/3", True)) as create, \
+             patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
+            intake.main()
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                intake.saved_repo(con, "C1", "100.1")
+                intake.remember_repo(con, "C1", "100.1", default_repo)
+                intake.thread_engaged(con, "C1", "100.1")
+                intake.mark_thread_engaged(con, "C1", "100.1")
+            handler = FakeApp.instance.handlers["message"]
+            handler({"channel": "C1", "ts": "102.1", "thread_ts": "100.1", "team": "T1",
+                     "user": "U1", "text": "Create a issue and solve it"}, say)
+            create.assert_called_once()
+            self.assertEqual(create.call_args.args[0], target_repo)
+            self.assertIn("agent skills used", create.call_args.args[2])
+            dispatch.assert_called_once_with(3, target_repo)
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                self.assertEqual(intake.saved_repo(con, "C1", "100.1"), target_repo)
+
+            with patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess(
+                    [], 0, "<|tool_call_start|>[glob(path='/home/triager')]<|tool_call_end|>", "")):
+                handler({"channel": "C1", "ts": "103.1", "thread_ts": "100.1", "team": "T1",
+                         "user": "U1", "text": "What was that?"}, say)
+            self.assertNotIn("tool_call", say.call_args.args[0])
+            self.assertNotIn("/home/triager", say.call_args.args[0])
+
+            # Switching projects invalidates the earlier project's task description.
+            switch = {"channel": "C2", "ts": "201.1", "thread_ts": "200.1", "team": "T1",
+                      "user": "U1", "text": f"Switch to https://github.com/{default_repo}"}
+            FakeApp.instance.client.conversations_replies = lambda **kwargs: {"messages": [
+                {**root, "channel": "C2", "ts": "200.1"}, switch]}
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                intake.saved_repo(con, "C2", "200.1")
+                intake.remember_repo(con, "C2", "200.1", target_repo)
+                intake.thread_engaged(con, "C2", "200.1")
+                intake.mark_thread_engaged(con, "C2", "200.1")
+            handler({"channel": "C2", "ts": "202.1", "thread_ts": "200.1", "team": "T1",
+                     "user": "U1", "text": "Create a issue and solve it"}, say)
+            create.assert_called_once()
+            self.assertIn("describe what to change", say.call_args.args[0].lower())
 
 
 if __name__ == "__main__":

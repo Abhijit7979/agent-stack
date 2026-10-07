@@ -28,6 +28,9 @@ COMMAND = re.compile(
 )
 REPO_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", re.I)
 ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)", re.I)
+REPO_HINT = re.compile(r"\bin\s+([A-Za-z0-9][A-Za-z0-9 ._-]{0,80}?)\s+(?:github\s+)?repo(?:sitory)?\b", re.I)
+REPO_TASK = re.compile(r"\b(?:add|update|fix|change|implement|build|create|remove|document)\b", re.I)
+GENERIC_ISSUE = re.compile(r"^\s*(?:and\s+)?(?:solve|fix|do|implement)\s+it[.!?\s]*$", re.I)
 LIST_ISSUES = re.compile(
     r"\b(?:what|which|list|show|current|open|how many|any)\b.*\bissues?\b"
     r"|\bissues?\b.*\b(?:we have|open|now)\b", re.I
@@ -75,11 +78,54 @@ def request_text(text, filename=None, pdf_text=None, develop=False):
     return title, body
 
 
+def generic_issue_request(text, command):
+    return bool(command and GENERIC_ISSUE.fullmatch(
+        REPO_HINT.sub("", text[command.end():], count=1).strip(" ,:.-\n")))
+
+
 def repo_from_text(text):
     match = REPO_URL.search(text)
     if not match:
         return None
     return f"{match.group(1)}/{match.group(2).removesuffix('.git').rstrip('.')}"
+
+
+def same_repo(left, right):
+    return bool(left and right) and left.casefold() == right.casefold()
+
+
+def repo_hint(text):
+    match = REPO_HINT.search(text)
+    if not match:
+        return None
+    hint = match.group(1).strip()
+    return None if hint.lower() in ("a", "this", "the", "that", "my", "same", "current") else hint
+
+
+def resolve_repo_hint(hint, token):
+    """Match a spoken repository name only when GitHub yields one unambiguous accessible repo."""
+    key = re.sub(r"[^a-z0-9]", "", hint.lower())
+    if not key:
+        return None
+    repos = []
+    for page in range(1, 11):
+        req = urllib.request.Request(
+            "https://api.github.com/user/repos?affiliation=owner,collaborator,organization_member"
+            f"&per_page=100&page={page}",
+            headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+        )
+        with urllib.request.urlopen(req, timeout=30) as response:
+            batch = json.load(response)
+        repos.extend(repo["full_name"] for repo in batch)
+        if len(batch) < 100:
+            break
+    else:
+        raise ValueError("I couldn't check every accessible repo. Please send its GitHub URL.")
+    names = [(repo, re.sub(r"[^a-z0-9]", "", repo.rsplit("/", 1)[1].lower())) for repo in repos]
+    exact = [repo for repo, name in names if name == key or name.removeprefix("the") == key.removeprefix("the")]
+    if len(exact) != 1:
+        raise ValueError(f"I couldn't uniquely identify the `{hint}` repo. Please send its GitHub URL.")
+    return exact[0]
 
 
 def saved_repo(con, channel, root_ts):
@@ -124,20 +170,55 @@ def thread_issue(con, client, event, bot_user):
     return None
 
 
-def repo_from_thread(client, event, bot_user, workspace_team):
+def repo_from_thread(client, event, bot_user, workspace_team, github_token):
     """Recover a repo link from a thread begun before context persistence existed."""
     try:
         messages = client.conversations_replies(channel=event["channel"],
                                                 ts=thread_root_ts(event), limit=100)["messages"]
-    except Exception:
-        return None
+    except Exception as exc:
+        raise ValueError("I couldn't check this thread's project. Please send the GitHub repository URL.") from exc
     for message in reversed(messages):
         if message.get("bot_id") or message.get("user") == bot_user:
             continue
-        repo = repo_from_text(message.get("text", ""))
-        if repo and workspace_member(message, client, workspace_team):
+        if not workspace_member(message, client, workspace_team):
+            continue
+        text = message.get("text", "")
+        linked = repo_from_text(text)
+        hint = repo_hint(text)
+        spoken = resolve_repo_hint(hint, github_token) if hint else None
+        if linked and spoken and not same_repo(linked, spoken):
+            raise ValueError("this thread names two different repositories. Please send one repository URL.")
+        repo = linked or spoken
+        if repo:
             return repo
     return None
+
+
+def task_from_thread(client, event, bot_user, workspace_team, target_repo, github_token):
+    try:
+        messages = client.conversations_replies(channel=event["channel"], ts=thread_root_ts(event), limit=100)["messages"]
+    except Exception as exc:
+        raise ValueError("I couldn't read the task in this thread. Please describe it again.") from exc
+    active_repo = task = None
+    for message in messages:
+        if message.get("bot_id") or message.get("user") == bot_user:
+            continue
+        if not workspace_member(message, client, workspace_team):
+            continue
+        text = message.get("text", "").replace(f"<@{bot_user}>", "").strip()
+        linked = repo_from_text(text)
+        hint = repo_hint(text)
+        spoken = resolve_repo_hint(hint, github_token) if hint else None
+        if linked and spoken and not same_repo(linked, spoken):
+            raise ValueError("this thread names two different repositories. Please describe the task again with one URL.")
+        mentioned = linked or spoken
+        if mentioned and not same_repo(mentioned, active_repo):
+            active_repo, task = mentioned, None
+        command = COMMAND.search(text)
+        if (same_repo(active_repo, target_repo) and REPO_TASK.search(text)
+                and not generic_issue_request(text, command)):
+            task = REPO_HINT.sub("", text, count=1).strip(" ,:.-\n")
+    return task
 
 
 def pdf_to_text(file_info, slack_token):
@@ -261,13 +342,15 @@ def ensure_agent_labels(repo, token):
 
 def queue_issue(repo, token, number):
     issue = github_get(repo, token, f"issues/{number}")
-    if issue.get("state") != "open" or "pull_request" in issue:
-        raise ValueError("that issue is not open.")
-    if issue.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
-        raise ValueError("the issue author is not a repository collaborator.")
+    if "pull_request" in issue:
+        raise ValueError("that is a pull request, not an issue.")
     labels = {item["name"] for item in issue.get("labels", [])}
     if "agent-pr" in labels:
         return "pr"
+    if issue.get("state") != "open":
+        raise ValueError("that issue is not open.")
+    if issue.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+        raise ValueError("the issue author is not a repository collaborator.")
     if "agent-working" in labels:
         return "working"
     ensure_agent_labels(repo, token)
@@ -414,7 +497,10 @@ def assistant_reply(text, model, session=None, speaker=None):
     )
     if result.returncode:
         raise ValueError("I couldn't answer just now. Please try again shortly.")
-    return result.stdout.strip()[:3000] or "I couldn't answer just now. Please try again shortly."
+    answer = result.stdout.strip()[:3000]
+    if re.search(r"<\|?tool_call_(?:start|end)\|?>|\[(?:read_file|glob)\(", answer, re.I):
+        return "I can't inspect repository files in chat. Ask me to make the change, and I'll start development in the linked repo."
+    return answer or "I couldn't answer just now. Please try again shortly."
 
 
 def claim(con, channel, ts):
@@ -478,21 +564,33 @@ def main():
                 start_request = bool(START_DEVELOPMENT.match(text))
                 unsupported_operation = bool(GITHUB_ACTION.match(text)) and not start_request
                 issue_command = COMMAND.search(text)
-                develop = not issue_command and not start_request and not unsupported_operation and bool(DEVELOP.match(text))
-                github_request = bool(files or issue_command or develop or start_request or LIST_ISSUES.search(text))
-                explicit_repo = repo_from_text(text)
-                member = workspace_member(event, app.client, workspace_team) if github_request or explicit_repo else False
+                hint = repo_hint(text)
+                develop = (not issue_command and not start_request and not unsupported_operation
+                           and bool(DEVELOP.match(text) or (hint and REPO_TASK.search(text))))
+                github_request = bool(files or issue_command or develop or start_request or LIST_ISSUES.search(text) or hint)
+                linked_repo = repo_from_text(text)
+                member = workspace_member(event, app.client, workspace_team) if github_request or linked_repo else False
                 if github_request and not member:
                     raise ValueError("only members of this Slack workspace can access GitHub through me.")
+                spoken_repo = resolve_repo_hint(hint, github_token) if hint else None
+                if linked_repo and spoken_repo and not same_repo(linked_repo, spoken_repo):
+                    raise ValueError(f"you mentioned both `{linked_repo}` and `{spoken_repo}`. "
+                                     "Please send one repository URL for this task.")
+                explicit_repo = linked_repo or spoken_repo
                 stored_repo = saved_repo(con, channel, root_ts)
-                target_repo = (explicit_repo or stored_repo
-                               or (repo_from_thread(app.client, event, bot_user, workspace_team)
-                                   if event.get("thread_ts") and github_request else None))
-                if target_repo and target_repo != stored_repo and member:
+                # A human's project mention in the thread outranks a stale saved value.
+                thread_repo = (repo_from_thread(app.client, event, bot_user, workspace_team, github_token)
+                               if not explicit_repo and event.get("thread_ts") and github_request else None)
+                target_repo = explicit_repo or thread_repo or stored_repo
+                if target_repo and not same_repo(target_repo, stored_repo) and member:
                     remember_repo(con, channel, root_ts, target_repo)
-                if github_request and not target_repo and re.search(r"\bthis repo\b", text, re.I):
-                    raise ValueError("please include the GitHub repository URL so I choose the right repo.")
-                target_repo = target_repo or repo
+                if github_request and not target_repo and not ISSUE_URL.search(text):
+                    raise ValueError("which repository should I use? Send its GitHub URL so I don't change the wrong project.")
+                generic_issue = generic_issue_request(text, issue_command)
+                if generic_issue and event.get("thread_ts"):
+                    existing = thread_issue(con, app.client, event, bot_user)
+                    if existing and same_repo(repo_from_text(existing), target_repo):
+                        start_request = True
                 if start_request:
                     match = ISSUE_URL.search(text)
                     issue_url = match.group() if match else thread_issue(con, app.client, event, bot_user)
@@ -500,7 +598,11 @@ def main():
                         reply = "Please create an issue in this thread or send its GitHub issue URL first."
                     else:
                         match = ISSUE_URL.search(issue_url)
-                        target_repo = f"{match.group(1)}/{match.group(2)}"
+                        issue_repo = f"{match.group(1)}/{match.group(2)}"
+                        if target_repo and not same_repo(issue_repo, target_repo):
+                            raise ValueError(f"the issue I found is in `{issue_repo}`, but this thread is about "
+                                             f"`{target_repo}`. Ask me to create the task in the correct repo.")
+                        target_repo = issue_repo
                         number = int(match.group(3))
                         state = queue_issue(target_repo, github_token, number)
                         if state == "pr":
@@ -513,7 +615,9 @@ def main():
                             dispatch_ready(number, target_repo)
                             reply = f"Queued development for {issue_url}. I'll post the PR in this thread."
                 elif (files or issue_command or develop) and not unsupported_operation:
-                    if target_repo != repo:
+                    if not target_repo:
+                        raise ValueError("which repository should I use? Send its GitHub URL so I don't change the wrong project.")
+                    if not same_repo(target_repo, repo):
                         try:
                             details = github_get(target_repo, github_token, "")
                         except urllib.error.HTTPError as exc:
@@ -524,8 +628,12 @@ def main():
                             raise ValueError(f"the bot cannot create issues in `{target_repo}`.")
                     ensure_agent_labels(target_repo, github_token)
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
-                    request = request_text(text, files[0].get("name") if files else None,
-                                           pdf_text, develop=develop)
+                    task_text = (task_from_thread(app.client, event, bot_user, workspace_team,
+                                                  target_repo, github_token) if generic_issue else None)
+                    if generic_issue and not task_text:
+                        raise ValueError(f"please describe what to change in `{target_repo}` before I create an issue.")
+                    request = request_text(task_text or text, files[0].get("name") if files else None,
+                                           pdf_text, develop=develop or bool(task_text))
                     issue_attempted = True
                     url, labelled = create_issue(target_repo, github_token, *request, channel, ts,
                                                  label="agent-ready")
@@ -542,8 +650,10 @@ def main():
                                  "Development will not start until that label is added.")
                 elif LIST_ISSUES.search(text):
                     reply = issue_reply(target_repo, github_token)
+                elif hint and explicit_repo:
+                    reply = f"Got it. I'll use `{target_repo}` for this thread."
                 elif unsupported_operation:
-                    reply = (f"I can start development in `{repo}` from a task description, "
+                    reply = (f"I can start development in `{target_repo or 'a linked repo'}` from a task description, "
                              "but cannot safely perform that GitHub operation from Slack yet.")
                 else:
                     reply = assistant_reply(text, model, session=session,
