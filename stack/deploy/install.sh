@@ -26,6 +26,7 @@ for u in ${RUNNER_USERS:-} ${TRIAGE_USER:-}; do sudo -n -u "$u" true || { echo "
 TOKEN_FILE="$HH/agent-gh-token"
 if [ -n "${GH_TOKEN:-}" ] && [ ! -s "$TOKEN_FILE" ]; then (umask 077 && printf '%s' "$GH_TOKEN" > "$TOKEN_FILE"); fi
 [ -s "$TOKEN_FILE" ] || { echo "no token: set GH_TOKEN in env or write $TOKEN_FILE (chmod 600)" >&2; exit 1; }
+if [ "$(id -u)" -eq 0 ]; then chown --reference="$HH" "$TOKEN_FILE"; fi
 chmod 600 "$TOKEN_FILE"
 sed -i '/^AGENT_GH_TOKEN=/d' "$HH/.env" 2>/dev/null || true   # migrate off the old passthrough
 hermes config set terminal.env_passthrough '[]'
