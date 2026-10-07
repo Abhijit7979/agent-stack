@@ -76,6 +76,13 @@ class IntakeTest(unittest.TestCase):
         self.assertTrue(labelled)
         self.assertNotIn("labels", json.loads(send.call_args.args[0].data))
 
+    def test_repo_preflight_uses_github_url_without_trailing_slash(self):
+        with patch.object(intake.urllib.request, "urlopen",
+                          return_value=io.BytesIO(b'{"has_issues":true}')) as send:
+            self.assertTrue(intake.github_get("acme/other", "secret", "")["has_issues"])
+        self.assertEqual(send.call_args.args[0].full_url,
+                         "https://api.github.com/repos/acme/other")
+
     def test_explicit_development_labels_issue_and_dispatches_without_slack_tokens(self):
         self.assertTrue(intake.DEVELOP.match("Can you build a home page?"))
         self.assertFalse(intake.DEVELOP.match("How do I build a home page?"))

@@ -182,7 +182,7 @@ def track_job(con, channel, root_ts, issue_url, started):
 
 def github_get(repo, token, path):
     req = urllib.request.Request(
-        f"https://api.github.com/repos/{repo}/{path}",
+        f"https://api.github.com/repos/{repo}" + (f"/{path}" if path else ""),
         headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
     )
     with urllib.request.urlopen(req, timeout=30) as response:
@@ -401,7 +401,12 @@ def main():
                              f"wrong repo; ask me to `create issue` in `{target_repo}` if you want a review-only issue.")
                 elif (files or issue_command or develop) and not unsupported_operation:
                     if target_repo != repo:
-                        details = github_get(target_repo, github_token, "")
+                        try:
+                            details = github_get(target_repo, github_token, "")
+                        except urllib.error.HTTPError as exc:
+                            if exc.code in (403, 404):
+                                raise ValueError(f"the bot cannot access `{target_repo}`. Check its GitHub access.") from exc
+                            raise
                         if not details.get("permissions", {}).get("push") or not details.get("has_issues"):
                             raise ValueError(f"the bot cannot create issues in `{target_repo}`.")
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
