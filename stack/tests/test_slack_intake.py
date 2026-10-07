@@ -31,6 +31,11 @@ class IntakeTest(unittest.TestCase):
                          ("Implement this with React",
                           "Slack request:\n\nImplement this with React\n\nPlan from plan.pdf:\n\nStep one"))
         self.assertIsNone(intake.request_text("hello"))
+        message = ("Hi , https://github.com/Abhijit7979/theastraveda_website\n\n"
+                   "Create a issue in this repo for improving readme file currently")
+        self.assertEqual(intake.repo_from_text(message), "Abhijit7979/theastraveda_website")
+        self.assertEqual(intake.request_text(message),
+                         ("improving readme file currently", "improving readme file currently"))
 
     def test_issue_list_stays_out_of_model(self):
         issues = io.BytesIO(json.dumps([
@@ -64,6 +69,12 @@ class IntakeTest(unittest.TestCase):
         self.assertIn("Submitted from Slack:", body["body"])
         self.assertTrue(labelled)
         self.assertTrue(url.endswith("/1"))
+        response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/other/issues/2"}).encode())
+        with patch.object(intake.urllib.request, "urlopen", return_value=response) as send:
+            _, labelled = intake.create_issue("acme/other", "secret", "Fix", "Details", "C123",
+                                              "123.456", label=None)
+        self.assertTrue(labelled)
+        self.assertNotIn("labels", json.loads(send.call_args.args[0].data))
 
     def test_explicit_development_labels_issue_and_dispatches_without_slack_tokens(self):
         self.assertTrue(intake.DEVELOP.match("Can you build a home page?"))
@@ -161,7 +172,10 @@ class IntakeTest(unittest.TestCase):
 
             def __init__(self, token):
                 self.client = types.SimpleNamespace(auth_test=lambda: {"user_id": "UBOT", "team_id": "T1"},
-                                                    users_info=lambda user: {"user": {"team_id": "T1"}})
+                                                    users_info=lambda user: {"user": {"team_id": "T1"}},
+                                                    conversations_replies=lambda **kwargs: {"messages": [
+                                                        {"user": "U1", "text": "See https://github.com/acme/other"}]
+                                                    })
                 self.handlers = {}
                 FakeApp.instance = self
 
@@ -195,6 +209,50 @@ class IntakeTest(unittest.TestCase):
             self.assertEqual(chat.call_args_list[0].kwargs["session"],
                              chat.call_args_list[1].kwargs["session"])
             self.assertEqual([call.kwargs["speaker"] for call in chat.call_args_list], ["U1", "U2"])
+
+            screenshot_request = {"channel": "C456", "ts": "200.1", "team": "T1", "user": "U1",
+                                  "text": ("Hi <@UBOT>, https://github.com/acme/other\n"
+                                           "Create a issue in this repo for improving readme")}
+            with patch.object(intake, "github_get", return_value={"permissions": {"push": True},
+                                                                 "has_issues": True}), \
+                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/3", True)) as create:
+                handler(screenshot_request, say)
+            self.assertEqual(create.call_args.args[0], "acme/other")
+            self.assertEqual(create.call_args.args[2], "improving readme")
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                self.assertEqual(intake.saved_repo(con, "C456", "200.1"), "acme/other")
+
+            # Recover a repository from a thread started before repo context was persisted.
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                con.execute("DELETE FROM thread_repos")
+                con.commit()
+            say.reset_mock()
+            other_repo = {"channel": "C123", "ts": "108.1", "thread_ts": "100.1",
+                          "text": "Create an issue to improve the README", "team": "T1", "user": "U2"}
+            with patch.object(intake, "github_get", return_value={"permissions": {"push": True},
+                                                                 "has_issues": True}) as get, \
+                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/2", True)) as create:
+                handler(other_repo, say)
+            get.assert_called_once_with("acme/other", "gh-secret", "")
+            self.assertEqual(create.call_args.args[0], "acme/other")
+            self.assertIsNone(create.call_args.kwargs["label"])
+            self.assertIn("acme/other/issues/2", say.call_args.args[0])
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                self.assertEqual(intake.saved_repo(con, "C123", "100.1"), "acme/other")
+
+            say.reset_mock()
+            external_development = {"channel": "C123", "ts": "109.1", "thread_ts": "100.1",
+                                    "text": "Build a home page", "team": "T1", "user": "U2"}
+            with patch.object(intake, "create_issue") as create:
+                handler(external_development, say)
+            create.assert_not_called()
+            self.assertIn("Development is only configured", say.call_args.args[0])
+
+            # The remaining checks use the default repository, not this thread's context.
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                con.execute("DELETE FROM thread_repos")
+                con.commit()
+            FakeApp.instance.client.conversations_replies = lambda **kwargs: {"messages": []}
 
             say.reset_mock()
             development = {"channel": "C123", "ts": "107.1", "thread_ts": "100.1",

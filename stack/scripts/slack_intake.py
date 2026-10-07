@@ -22,9 +22,11 @@ SESSION_LOCKS = tuple(threading.Lock() for _ in range(64))
 MAX_PDF_BYTES = 10 * 1024 * 1024
 MAX_BODY_CHARS = 45_000
 COMMAND = re.compile(
-    r"^\s*(?:(?:please|can you|could you)\s+)?(?:create|open|add)\s+(?:an?\s+)?"
-    r"(?:github\s+)?issue\b(?:\s+(?:for|to|about))?\s*:?\s*", re.I
+    r"^[ \t]*(?:(?:please|can you|could you)\s+)?(?:create|open|add)\s+(?:an?\s+)?"
+    r"(?:github\s+)?issue\b(?:\s+in\s+(?:(?:this|the)\s+)?repo(?:sitory)?)?"
+    r"(?:\s+(?:for|to|about))?[ \t]*:?[ \t]*", re.I | re.M
 )
+REPO_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", re.I)
 LIST_ISSUES = re.compile(
     r"\b(?:what|which|list|show|current|open|how many|any)\b.*\bissues?\b"
     r"|\bissues?\b.*\b(?:we have|open|now)\b", re.I
@@ -46,7 +48,7 @@ GITHUB_ACTION = re.compile(
 
 def request_text(text, filename=None, pdf_text=None, develop=False):
     """Return an issue title/body, or None when this is not an intake request."""
-    match = COMMAND.match(text)
+    match = COMMAND.search(text)
     if not match and pdf_text is None and not develop:
         return None
     content = text[match.end() :] if match else text.strip()
@@ -65,6 +67,42 @@ def request_text(text, filename=None, pdf_text=None, develop=False):
     if len(body) > MAX_BODY_CHARS:
         raise ValueError("Plan is too long for one issue; please split it into smaller PDFs.")
     return title, body
+
+
+def repo_from_text(text):
+    match = REPO_URL.search(text)
+    if not match:
+        return None
+    return f"{match.group(1)}/{match.group(2).removesuffix('.git').rstrip('.')}"
+
+
+def saved_repo(con, channel, root_ts):
+    con.execute("CREATE TABLE IF NOT EXISTS thread_repos (channel TEXT NOT NULL, root_ts TEXT NOT NULL, "
+                "repo TEXT NOT NULL, PRIMARY KEY (channel, root_ts))")
+    row = con.execute("SELECT repo FROM thread_repos WHERE channel=? AND root_ts=?",
+                      (channel, root_ts)).fetchone()
+    return row[0] if row else None
+
+
+def remember_repo(con, channel, root_ts, repo):
+    con.execute("INSERT OR REPLACE INTO thread_repos VALUES (?, ?, ?)", (channel, root_ts, repo))
+    con.commit()
+
+
+def repo_from_thread(client, event, bot_user, workspace_team):
+    """Recover a repo link from a thread begun before context persistence existed."""
+    try:
+        messages = client.conversations_replies(channel=event["channel"],
+                                                ts=thread_root_ts(event), limit=100)["messages"]
+    except Exception:
+        return None
+    for message in reversed(messages):
+        if message.get("bot_id") or message.get("user") == bot_user:
+            continue
+        repo = repo_from_text(message.get("text", ""))
+        if repo and workspace_member(message, client, workspace_team):
+            return repo
+    return None
 
 
 def pdf_to_text(file_info, slack_token):
@@ -95,14 +133,16 @@ def pdf_to_text(file_info, slack_token):
 
 
 def create_issue(repo, token, title, body, channel, ts, label="needs-human"):
-    if label not in ("needs-human", "agent-ready"):
+    if label not in (None, "needs-human", "agent-ready"):
         raise ValueError("Unsupported issue label.")
     permalink = f"https://app.slack.com/archives/{channel}/p{ts.replace('.', '')}"
-    payload = json.dumps({
+    issue_data = {
         "title": title,
         "body": f"Submitted from Slack: {permalink}\n\n{body}",
-        "labels": [label],
-    }).encode()
+    }
+    if label:
+        issue_data["labels"] = [label]
+    payload = json.dumps(issue_data).encode()
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/issues",
         data=payload,
@@ -116,7 +156,7 @@ def create_issue(repo, token, title, body, channel, ts, label="needs-human"):
     )
     with urllib.request.urlopen(req, timeout=30) as response:
         issue = json.load(response)
-    labelled = any(item["name"] == label for item in issue.get("labels", []))
+    labelled = label is None or any(item["name"] == label for item in issue.get("labels", []))
     return issue["html_url"], labelled
 
 
@@ -340,17 +380,36 @@ def main():
                 if len(files) > 1:
                     raise ValueError("please send one PDF at a time.")
                 unsupported_operation = bool(GITHUB_ACTION.match(text))
-                develop = not COMMAND.match(text) and not unsupported_operation and bool(DEVELOP.match(text))
-                if (files or COMMAND.match(text) or develop or LIST_ISSUES.search(text)) and not workspace_member(
-                        event, app.client, workspace_team):
+                issue_command = COMMAND.search(text)
+                develop = not issue_command and not unsupported_operation and bool(DEVELOP.match(text))
+                github_request = bool(files or issue_command or develop or LIST_ISSUES.search(text))
+                explicit_repo = repo_from_text(text)
+                member = workspace_member(event, app.client, workspace_team) if github_request or explicit_repo else False
+                if github_request and not member:
                     raise ValueError("only members of this Slack workspace can access GitHub through me.")
-                if (files or COMMAND.match(text) or develop) and not unsupported_operation:
+                stored_repo = saved_repo(con, channel, root_ts)
+                target_repo = (explicit_repo or stored_repo
+                               or (repo_from_thread(app.client, event, bot_user, workspace_team)
+                                   if event.get("thread_ts") and github_request else None))
+                if target_repo and target_repo != stored_repo and member:
+                    remember_repo(con, channel, root_ts, target_repo)
+                if github_request and not target_repo and re.search(r"\bthis repo\b", text, re.I):
+                    raise ValueError("please include the GitHub repository URL so I choose the right repo.")
+                target_repo = target_repo or repo
+                if develop and target_repo != repo:
+                    reply = (f"Development is only configured for `{repo}`. I won't create a task in the "
+                             f"wrong repo; ask me to `create issue` in `{target_repo}` if you want a review-only issue.")
+                elif (files or issue_command or develop) and not unsupported_operation:
+                    if target_repo != repo:
+                        details = github_get(target_repo, github_token, "")
+                        if not details.get("permissions", {}).get("push") or not details.get("has_issues"):
+                            raise ValueError(f"the bot cannot create issues in `{target_repo}`.")
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
                     request = request_text(text, files[0].get("name") if files else None,
                                            pdf_text, develop=develop)
                     issue_attempted = True
-                    label = "agent-ready" if develop else "needs-human"
-                    url, labelled = create_issue(repo, github_token, *request, channel, ts,
+                    label = "agent-ready" if develop else "needs-human" if target_repo == repo else None
+                    url, labelled = create_issue(target_repo, github_token, *request, channel, ts,
                                                  label=label)
                     if develop and labelled:
                         try:
@@ -364,13 +423,15 @@ def main():
                     elif develop:
                         reply = (f"Created {url}, but GitHub did not apply `agent-ready`. "
                                  "Development will not start until that label is added.")
+                    elif target_repo != repo:
+                        reply = f"Created {url} in `{target_repo}`. No development was started."
                     else:
                         reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
                                  "by changing the label to `agent-ready`." if labelled else
                                  f"Created {url}, but GitHub did not apply `needs-human`. "
                                  "It will not be auto-triaged; please label it before approval.")
                 elif LIST_ISSUES.search(text):
-                    reply = issue_reply(repo, github_token)
+                    reply = issue_reply(target_repo, github_token)
                 elif unsupported_operation:
                     reply = (f"I can start development in `{repo}` from a task description, "
                              "but cannot safely perform that GitHub operation from Slack yet.")
@@ -378,7 +439,7 @@ def main():
                     reply = assistant_reply(text, model, session=session,
                                             speaker=event.get("user") if not direct else None)
             except (ValueError, urllib.error.URLError, TimeoutError, subprocess.TimeoutExpired,
-                    subprocess.CalledProcessError) as exc:
+                    subprocess.CalledProcessError, sqlite3.Error) as exc:
                 if issue_attempted:
                     reply = ("I may have created the GitHub issue, but could not confirm it. "
                              "Please check GitHub before sending the request again.")
