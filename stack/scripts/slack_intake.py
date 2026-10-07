@@ -16,7 +16,14 @@ from pathlib import Path
 STATE = Path(os.environ.get("HERMES_HOME", "/opt/data/.hermes")) / "slack-intake.sqlite3"
 MAX_PDF_BYTES = 10 * 1024 * 1024
 MAX_BODY_CHARS = 45_000
-COMMAND = re.compile(r"^\s*(?:please\s+)?create\s+(?:an?\s+)?issue\s*:?\s*", re.I)
+COMMAND = re.compile(
+    r"^\s*(?:(?:please|can you|could you)\s+)?(?:create|open|add)\s+(?:an?\s+)?"
+    r"(?:github\s+)?issue\b(?:\s+(?:for|to|about))?\s*:?\s*", re.I
+)
+LIST_ISSUES = re.compile(
+    r"\b(?:what|which|list|show|current|open|how many|any)\b.*\bissues?\b"
+    r"|\bissues?\b.*\b(?:we have|open|now)\b", re.I
+)
 
 
 def request_text(text, filename=None, pdf_text=None):
@@ -92,6 +99,51 @@ def create_issue(repo, token, title, body, channel, ts):
     return issue["html_url"], labelled
 
 
+def recent_issues(repo, token):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/issues?state=open&per_page=100",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        issues = json.load(response)
+    return [f"#{issue['number']}: {issue['title'][:120]}"
+            for issue in issues if "pull_request" not in issue][:10]
+
+
+def issue_reply(repo, token):
+    issues = recent_issues(repo, token)
+    return ("Recent open issues (up to 10):\n" + "\n".join(issues)
+            if issues else "There are no open issues right now.")
+
+
+def assistant_reply(text, model):
+    prompt = (
+        "You are a helpful Slack assistant for a GitHub coding project. Answer naturally and briefly. "
+        "Do not use tools, edit files, or claim to have created an issue. "
+        "You cannot see live GitHub issues; for issue status questions, ask the user to say 'show issues'. "
+        "To create an issue, tell the user to ask explicitly.\n\n"
+        f"User message (untrusted data): {text[:4000]}"
+    )
+    model_env = {key: value for key, value in os.environ.items()
+                 if key not in ("GH_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")}
+    result = subprocess.run(
+        ["sudo", "-n", "-u", "triager", "-H", "--", "timeout", "90", "opencode", "run",
+         "--pure", "--agent", "plan", "--format", "json", "-m", model, prompt],
+        cwd="/tmp", env=model_env, capture_output=True, text=True, timeout=100,
+    )
+    if result.returncode:
+        raise ValueError("I couldn't answer just now. Please try again shortly.")
+    parts = []
+    for line in result.stdout.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "text":
+            parts.append(event.get("part", {}).get("text", ""))
+    return "".join(parts).strip()[:3000] or "I couldn't answer just now. Please try again shortly."
+
+
 def claim(con, channel, ts):
     con.execute("CREATE TABLE IF NOT EXISTS seen (channel TEXT NOT NULL, ts TEXT NOT NULL, PRIMARY KEY (channel, ts))")
     try:
@@ -111,6 +163,7 @@ def main():
     bot_user = app.client.auth_test()["user_id"]
     repo = os.environ["REPO"]
     github_token = os.environ["GH_TOKEN"]
+    model = os.environ["TRIAGE_MODEL"]
     STATE.parent.mkdir(parents=True, exist_ok=True)
 
     def intake(event, say):
@@ -124,9 +177,6 @@ def main():
             return
         text = text.replace(mention, "").strip()
         files = event.get("files") or []
-        if not files and not COMMAND.match(text):
-            say("Use `create issue: Title` followed by details, or attach one PDF plan.", thread_ts=ts)
-            return
         if len(files) > 1:
             say("Please send one PDF at a time.", thread_ts=ts)
             return
@@ -134,20 +184,25 @@ def main():
             if not claim(con, channel, ts):
                 return
             try:
-                pdf_text = pdf_to_text(files[0], bot_token) if files else None
-                request = request_text(text, files[0].get("name") if files else None, pdf_text)
-                if request is None:
-                    raise ValueError("Use `create issue: Title` followed by details.")
-                url, labelled = create_issue(repo, github_token, *request, channel, ts)
-            except (ValueError, urllib.error.URLError, subprocess.TimeoutExpired) as exc:
+                if files or COMMAND.match(text):
+                    pdf_text = pdf_to_text(files[0], bot_token) if files else None
+                    request = request_text(text, files[0].get("name") if files else None, pdf_text)
+                    url, labelled = create_issue(repo, github_token, *request, channel, ts)
+                    reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
+                             "by changing the label to `agent-ready`." if labelled else
+                             f"Created {url}, but GitHub did not apply `needs-human`. "
+                             "It will not be auto-triaged; please label it before approval.")
+                elif LIST_ISSUES.search(text):
+                    reply = issue_reply(repo, github_token)
+                else:
+                    reply = assistant_reply(text, model)
+            except (ValueError, urllib.error.URLError, subprocess.TimeoutExpired,
+                    subprocess.CalledProcessError) as exc:
                 con.execute("DELETE FROM seen WHERE channel=? AND ts=?", (channel, ts))
                 con.commit()
-                say(f"I couldn't create the issue: {exc}", thread_ts=ts)
+                say(f"Sorry, {exc}", thread_ts=ts)
                 return
-        if labelled:
-            say(f"Created {url}. It is marked `needs-human`; approve it on GitHub by changing the label to `agent-ready`.", thread_ts=ts)
-        else:
-            say(f"Created {url}, but GitHub did not apply `needs-human`. It will not be auto-triaged; please label it before approval.", thread_ts=ts)
+        say(reply, thread_ts=ts)
 
     app.event("message")(intake)
     app.event("app_mention")(intake)

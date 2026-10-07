@@ -20,9 +20,31 @@ spec.loader.exec_module(intake)
 class IntakeTest(unittest.TestCase):
     def test_message_and_pdf(self):
         self.assertEqual(intake.request_text("create issue: Fix login\nIt fails"), ("Fix login", "It fails"))
+        self.assertEqual(intake.request_text("can you create an issue for fixing login"),
+                         ("fixing login", "fixing login"))
         self.assertEqual(intake.request_text("Implement this", "plan.pdf", "Step one"),
                          ("Implement this", "Plan from plan.pdf:\n\nStep one"))
         self.assertIsNone(intake.request_text("hello"))
+
+    def test_issue_list_stays_out_of_model(self):
+        issues = io.BytesIO(json.dumps([
+            {"number": 3, "title": "Fix login"},
+            {"number": 4, "title": "PR", "pull_request": {}},
+        ]).encode())
+        with patch.object(intake.urllib.request, "urlopen", return_value=issues):
+            self.assertEqual(intake.recent_issues("acme/app", "secret"), ["#3: Fix login"])
+        self.assertIsNotNone(intake.LIST_ISSUES.search("What issues we have now?"))
+        with patch.object(intake, "recent_issues", return_value=["#3: Fix login"]):
+            self.assertEqual(intake.issue_reply("acme/app", "secret"),
+                             "Recent open issues (up to 10):\n#3: Fix login")
+        reply = '{"type":"text","part":{"text":"Issue #3 is Fix login."}}\n'
+        with patch.object(intake.urllib.request, "urlopen") as send, \
+             patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, reply, "")) as run:
+            self.assertEqual(intake.assistant_reply("Hi", "model"),
+                             "Issue #3 is Fix login.")
+        send.assert_not_called()
+        self.assertNotIn("Fix login", run.call_args.args[0][-1])
+        self.assertIn("--agent", run.call_args.args[0])
 
     def test_issue_is_review_only(self):
         response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/app/issues/1",
