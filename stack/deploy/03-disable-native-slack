@@ -1,0 +1,5 @@
+#!/command/with-contenv sh
+set -eu
+
+# The gateway keeps cron running; slack_intake.py is the only Slack socket client.
+runuser -u hermes -- env HERMES_HOME=/opt/data /opt/hermes/.venv/bin/hermes config set platforms.slack.enabled false >/dev/null

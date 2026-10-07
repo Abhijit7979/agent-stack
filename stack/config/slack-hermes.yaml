@@ -1,0 +1,3 @@
+# Chat-only Hermes profile for public Slack conversations. No tools or MCP servers.
+platform_toolsets:
+  cli: []

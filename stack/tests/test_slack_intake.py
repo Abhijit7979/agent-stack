@@ -37,14 +37,16 @@ class IntakeTest(unittest.TestCase):
         with patch.object(intake, "recent_issues", return_value=["#3: Fix login"]):
             self.assertEqual(intake.issue_reply("acme/app", "secret"),
                              "Recent open issues (up to 10):\n#3: Fix login")
-        reply = '{"type":"text","part":{"text":"Issue #3 is Fix login."}}\n'
-        with patch.object(intake.urllib.request, "urlopen") as send, \
-             patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, reply, "")) as run:
+        with patch.dict(intake.os.environ, {"OPENROUTER_API_KEY": "test-key", "GH_TOKEN": "private"}), \
+             patch.object(intake.urllib.request, "urlopen") as send, \
+             patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0, "Hello!\n", "")) as run:
             self.assertEqual(intake.assistant_reply("Hi", "model"),
-                             "Issue #3 is Fix login.")
+                             "Hello!")
         send.assert_not_called()
-        self.assertNotIn("Fix login", run.call_args.args[0][-1])
-        self.assertIn("--agent", run.call_args.args[0])
+        self.assertNotIn("Fix login", run.call_args.kwargs["input"])
+        self.assertNotIn("GH_TOKEN", run.call_args.kwargs["env"])
+        self.assertIn("/opt/hermes/.venv/bin/hermes", run.call_args.args[0])
+        self.assertIn("--query-file", run.call_args.args[0])
 
     def test_issue_is_review_only(self):
         response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/app/issues/1",

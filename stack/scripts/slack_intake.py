@@ -124,24 +124,21 @@ def assistant_reply(text, model):
         "To create an issue, tell the user to ask explicitly.\n\n"
         f"User message (untrusted data): {text[:4000]}"
     )
-    model_env = {key: value for key, value in os.environ.items()
-                 if key not in ("GH_TOKEN", "SLACK_APP_TOKEN", "SLACK_BOT_TOKEN")}
+    if not os.environ.get("OPENROUTER_API_KEY"):
+        raise ValueError("Hermes is not configured with an OpenRouter key yet.")
+    model_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                 "HERMES_HOME": "/home/triager/.hermes",
+                 "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"]}
     result = subprocess.run(
-        ["sudo", "-n", "-u", "triager", "-H", "--", "timeout", "90", "opencode", "run",
-         "--pure", "--agent", "plan", "--format", "json", "-m", model, prompt],
-        cwd="/tmp", env=model_env, capture_output=True, text=True, timeout=100,
+        ["sudo", "-n", "-E", "-u", "triager", "-H", "--", "timeout", "90",
+         "/opt/hermes/.venv/bin/hermes", "chat", "--oneshot", "--quiet",
+         "--ignore-rules", "--query-file", "-", "--provider", "openrouter",
+         "--model", model],
+        cwd="/tmp", env=model_env, input=prompt, capture_output=True, text=True, timeout=100,
     )
     if result.returncode:
         raise ValueError("I couldn't answer just now. Please try again shortly.")
-    parts = []
-    for line in result.stdout.splitlines():
-        try:
-            event = json.loads(line)
-        except json.JSONDecodeError:
-            continue
-        if event.get("type") == "text":
-            parts.append(event.get("part", {}).get("text", ""))
-    return "".join(parts).strip()[:3000] or "I couldn't answer just now. Please try again shortly."
+    return result.stdout.strip()[:3000] or "I couldn't answer just now. Please try again shortly."
 
 
 def claim(con, channel, ts):
@@ -163,7 +160,7 @@ def main():
     bot_user = app.client.auth_test()["user_id"]
     repo = os.environ["REPO"]
     github_token = os.environ["GH_TOKEN"]
-    model = os.environ["TRIAGE_MODEL"]
+    model = os.environ.get("SLACK_CHAT_MODEL", "openrouter/free")
     STATE.parent.mkdir(parents=True, exist_ok=True)
 
     def intake(event, say):

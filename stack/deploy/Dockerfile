@@ -12,6 +12,9 @@ RUN apt-get -o Acquire::Retries=3 update \
  && echo 'hermes ALL=(runner1,runner2,triager) NOPASSWD: ALL' > /etc/sudoers.d/runners && chmod 440 /etc/sudoers.d/runners \
  && mkdir -p /srv/agent-work/wt /srv/agent-work/git /srv/agent-work/logs \
  && chown -R hermes:hermes /srv/agent-work \
- && chmod 711 /srv/agent-work /srv/agent-work/wt && chmod 700 /srv/agent-work/git /srv/agent-work/logs
+ && chmod 711 /srv/agent-work /srv/agent-work/wt && chmod 700 /srv/agent-work/git /srv/agent-work/logs \
+ && install -d -o triager -g triager /home/triager/.hermes
 
 COPY --chown=root:root . /stack
+COPY --chown=triager:triager config/slack-hermes.yaml /home/triager/.hermes/config.yaml
+COPY --chown=root:root --chmod=755 deploy/03-disable-native-slack /etc/cont-init.d/03-disable-native-slack
