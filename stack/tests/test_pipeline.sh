@@ -29,6 +29,7 @@ case "\$1 \$2" in
   "issue list") [[ "\$*" == *agent-working* ]] && { echo "\${WORKING:-0}"; exit; }
                 q="\${@: -1}"; echo '[{"number":13,"createdAt":"3"},{"number":11,"createdAt":"1"},{"number":12,"createdAt":"2"}]' | jq -r "\$q" ;;
   api*) case "\$*" in
+          *.default_branch*) echo main ;;
           *branches/*) [ -n "\${PROTECTED:-}" ] && echo 1 || echo 0 ;;
           *issues\?state*) q="\${@: -1}"; echo '[{"number":21,"author_association":"COLLABORATOR","body":"Please fix it.","labels":[]},
               {"number":22,"author_association":"NONE","labels":[]},
@@ -55,6 +56,7 @@ esac
 EOF
 printf '#!/usr/bin/env bash\nshift; exec "$@"\n' > "$T/bin/timeout"
 printf '#!/usr/bin/env bash\nexec "$@"\n' > "$T/bin/setsid"
+command -v flock >/dev/null || printf '#!/usr/bin/env bash\nexit 0\n' > "$T/bin/flock"
 chmod +x "$T"/bin/* "$T"/scripts/*.sh
 export PATH="$T/bin:$PATH" GH_TOKEN=secret
 
@@ -67,7 +69,7 @@ check "opens PR" 'grep -q "pr create" "$T/gh.log"'
 check "auto-merge on" 'grep -q "pr merge .* --auto" "$T/gh.log"'
 check "labels agent-pr" 'grep -q "add-label agent-pr" "$T/gh.log"'
 check "runner never sees GH_TOKEN" 'grep -q "token=none" "$T/runner.log"'
-check "workspace cleaned" '[ ! -d "$T/work/wt/5" ]'
+check "workspace cleaned" '[ ! -d "$T/work/wt/acme--app-5" ]'
 
 # 2. no branch protection -> PR only
 run AUTOMERGE=true
@@ -101,9 +103,15 @@ check "fake .git ignored, still ships" '[ ! -e "$T/pwned" ] && grep -q "pr creat
 # 8. dispatch fills only free slots (MAX_PARALLEL=2, 1 working -> 1 dispatched)
 rm -f "$T/gh.log"
 out="$(WORKING=1 RUNNER_DOES=none "$T/scripts/dispatch.sh")"; sleep 1
-check "dispatch respects MAX_PARALLEL" '[ "$out" = "Dispatched #11 to opencode" ]'
+check "dispatch respects MAX_PARALLEL" '[ "$out" = "Dispatched acme/app#11 to opencode" ]'
 check "dispatch claims before launch" 'grep -q "issue edit 11 .*--add-label agent-working" "$T/gh.log"'
 check "dispatch silent when full" '[ -z "$(WORKING=2 "$T/scripts/dispatch.sh")" ]'
+out="$(WORKING=0 RUNNER_DOES=none "$T/scripts/dispatch.sh" acme/other 12)"; sleep 1
+check "dispatch targets external repo issue" '[[ "$out" == *"Dispatched acme/other#12"* ]] && grep -q "issue edit 12 -R acme/other" "$T/gh.log"'
+run RUNNER_DOES=edit
+rm -f "$T/gh.log" "$T/runner.log"
+RUNNER_DOES=edit "$T/scripts/work-issue.sh" 5 acme/other >/dev/null 2>&1
+check "external worker uses target repo and default branch" 'grep -q "api repos/acme/other --jq .default_branch" "$T/gh.log" && grep -q "pr create -R acme/other --base main" "$T/gh.log"'
 
 # 9. triage: only the trusted, unlabelled issue is classified; verdict applied by code
 rm -f "$T/gh.log"

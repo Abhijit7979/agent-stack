@@ -59,7 +59,7 @@ class IntakeTest(unittest.TestCase):
         self.assertIn("/opt/hermes/.venv/bin/hermes", run.call_args.args[0])
         self.assertIn("--query-file", run.call_args.args[0])
 
-    def test_issue_is_review_only(self):
+    def test_create_issue_labels_and_slack_link(self):
         response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/app/issues/1",
                                           "labels": [{"name": "needs-human"}]}).encode())
         with patch.object(intake.urllib.request, "urlopen", return_value=response) as send:
@@ -91,6 +91,7 @@ class IntakeTest(unittest.TestCase):
         self.assertTrue(intake.GITHUB_ACTION.match("create a new repo"))
         self.assertTrue(intake.GITHUB_ACTION.match("merge PR #3"))
         self.assertTrue(intake.GITHUB_ACTION.match("fix issue #3"))
+        self.assertTrue(intake.START_DEVELOPMENT.match("Start development"))
         self.assertFalse(intake.GITHUB_ACTION.match("Build a home page and open a PR"))
         self.assertEqual(intake.request_text("Fix login", develop=True), ("Fix login", "Fix login"))
         response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/app/issues/2",
@@ -103,10 +104,10 @@ class IntakeTest(unittest.TestCase):
         with patch.dict(intake.os.environ, {"HERMES_HOME": "/opt/data", "GH_TOKEN": "gh-secret",
                                          "SLACK_BOT_TOKEN": "bot-secret", "SLACK_APP_TOKEN": "app-secret"}), \
              patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0,
-                                                                                "Dispatched #2 to opencode\n", "")) as run:
-            self.assertTrue(intake.dispatch_ready(2))
-            self.assertFalse(intake.dispatch_ready(3))
-        self.assertEqual(run.call_args.args[0], ["/opt/data/scripts/dispatch.sh"])
+                                                                                "Dispatched acme/app#2 to opencode\n", "")) as run:
+            self.assertTrue(intake.dispatch_ready(2, "acme/app"))
+            self.assertFalse(intake.dispatch_ready(3, "acme/app"))
+        self.assertEqual(run.call_args.args[0], ["/opt/data/scripts/dispatch.sh", "acme/app", "3"])
         self.assertNotIn("SLACK_BOT_TOKEN", run.call_args.kwargs["env"])
         self.assertNotIn("SLACK_APP_TOKEN", run.call_args.kwargs["env"])
 
@@ -122,9 +123,10 @@ class IntakeTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(intake, "STATE", Path(directory) / "state.db"):
             with closing(sqlite3.connect(intake.STATE)) as con:
-                intake.track_job(con, "C123", "100.1", "https://github.com/acme/app/issues/2", False)
+                intake.track_job(con, "C123", "100.1", "https://github.com/acme/app/issues/2", "acme/app")
             client = Mock()
-            with patch.object(intake, "issue_status", return_value=("working", "Started")):
+            with patch.object(intake, "dispatch_ready", return_value=True), \
+                 patch.object(intake, "issue_status", return_value=("working", "Started")):
                 intake.poll_status(client, "acme/app", "secret")
                 intake.poll_status(client, "acme/app", "secret")
             client.chat_postMessage.assert_called_once_with(channel="C123", thread_ts="100.1",
@@ -134,7 +136,7 @@ class IntakeTest(unittest.TestCase):
                 intake.poll_status(client, "acme/app", "secret")
             self.assertEqual(client.chat_postMessage.call_count, 2)
             with closing(sqlite3.connect(intake.STATE)) as con:
-                self.assertEqual(con.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+                self.assertEqual(con.execute("SELECT count(*) FROM jobs_v2").fetchone()[0], 0)
         with patch.object(intake, "github_get", side_effect=[
                 {"labels": [{"name": "agent-pr"}]},
                 [{"body": "🤖 https://github.com/acme/app/pull/7 — ready"}]]):
@@ -222,10 +224,13 @@ class IntakeTest(unittest.TestCase):
                                            "Create a issue in this repo for improving readme")}
             with patch.object(intake, "github_get", return_value={"permissions": {"push": True},
                                                                  "has_issues": True}), \
-                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/3", True)) as create:
+                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/3", True)) as create, \
+                 patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
                 handler(screenshot_request, say)
             self.assertEqual(create.call_args.args[0], "acme/other")
             self.assertEqual(create.call_args.args[2], "improving readme")
+            self.assertEqual(create.call_args.kwargs["label"], "agent-ready")
+            dispatch.assert_called_once_with(3, "acme/other")
             with closing(sqlite3.connect(intake.STATE)) as con:
                 self.assertEqual(intake.saved_repo(con, "C456", "200.1"), "acme/other")
 
@@ -238,22 +243,26 @@ class IntakeTest(unittest.TestCase):
                           "text": "Create an issue to improve the README", "team": "T1", "user": "U2"}
             with patch.object(intake, "github_get", return_value={"permissions": {"push": True},
                                                                  "has_issues": True}) as get, \
-                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/2", True)) as create:
+                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/other/issues/2", True)) as create, \
+                 patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
                 handler(other_repo, say)
-            get.assert_called_once_with("acme/other", "gh-secret", "")
+            self.assertEqual(get.call_args_list[0].args, ("acme/other", "gh-secret", ""))
             self.assertEqual(create.call_args.args[0], "acme/other")
-            self.assertIsNone(create.call_args.kwargs["label"])
+            self.assertEqual(create.call_args.kwargs["label"], "agent-ready")
+            dispatch.assert_called_once_with(2, "acme/other")
             self.assertIn("acme/other/issues/2", say.call_args.args[0])
             with closing(sqlite3.connect(intake.STATE)) as con:
                 self.assertEqual(intake.saved_repo(con, "C123", "100.1"), "acme/other")
 
             say.reset_mock()
             external_development = {"channel": "C123", "ts": "109.1", "thread_ts": "100.1",
-                                    "text": "Build a home page", "team": "T1", "user": "U2"}
-            with patch.object(intake, "create_issue") as create:
+                                    "text": "Start development", "team": "T1", "user": "U2"}
+            with patch.object(intake, "github_get", return_value={"state": "open", "author_association": "COLLABORATOR",
+                                                                 "labels": [{"name": "agent-ready"}]}), \
+                 patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
                 handler(external_development, say)
-            create.assert_not_called()
-            self.assertIn("Development is only configured", say.call_args.args[0])
+            dispatch.assert_called_once_with(2, "acme/other")
+            self.assertIn("Queued development", say.call_args.args[0])
 
             # The remaining checks use the default repository, not this thread's context.
             with closing(sqlite3.connect(intake.STATE)) as con:
@@ -265,12 +274,13 @@ class IntakeTest(unittest.TestCase):
             development = {"channel": "C123", "ts": "107.1", "thread_ts": "100.1",
                            "text": "Can you build a home page and open a PR?", "team": "T1", "user": "U2"}
             with patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/2", True)) as create, \
+                 patch.object(intake, "ensure_agent_labels"), \
                  patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
                 handler(development, say)
                 handler(development, say)
             create.assert_called_once()
             self.assertEqual(create.call_args.kwargs["label"], "agent-ready")
-            dispatch.assert_called_once_with(2)
+            dispatch.assert_called_once_with(2, "acme/app")
             self.assertEqual(say.call_count, 1)
             self.assertEqual(say.call_args.kwargs["thread_ts"], "100.1")
 
@@ -287,6 +297,7 @@ class IntakeTest(unittest.TestCase):
                 return io.BytesIO(b"[]")
 
             with patch.object(intake.urllib.request, "urlopen", side_effect=lost_response), \
+                 patch.object(intake, "ensure_agent_labels"), \
                  patch.object(intake, "create_issue", wraps=intake.create_issue) as create:
                 handler(uncertain, say)
                 handler(uncertain, say)
@@ -298,7 +309,9 @@ class IntakeTest(unittest.TestCase):
             say.side_effect = [RuntimeError("send failed"), None]
             issue = {"channel": "C123", "ts": "105.1", "thread_ts": "100.1",
                      "text": "create issue: Fix login", "team": "T1", "user": "U1"}
-            with patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/1", True)) as create:
+            with patch.object(intake, "ensure_agent_labels"), \
+                 patch.object(intake, "dispatch_ready", return_value=True), \
+                 patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/1", True)) as create:
                 with self.assertRaises(RuntimeError):
                     handler(issue, say)
                 handler(issue, say)

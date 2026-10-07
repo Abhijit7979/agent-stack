@@ -7,9 +7,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 source "$HERE/stack.env"
 
 N="$1"
+DEFAULT_REPO="$REPO"
+REPO="${2:-$REPO}"
+[[ "$N" =~ ^[0-9]+$ && "$REPO" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || { echo "invalid issue or repository" >&2; exit 2; }
 BRANCH="agent/issue-$N"
-WT="$WORK_ROOT/wt/$N"   # work tree: writable by this task's runner user only (ACL)
-GD="$WORK_ROOT/git/$N"  # git metadata: hermes-only, the runner can't read or replace it
+KEY="${REPO//\//--}-$N"
+WT="$WORK_ROOT/wt/$KEY"   # work tree: writable by this task's runner user only (ACL)
+GD="$WORK_ROOT/git/$KEY"  # git metadata: hermes-only, the runner can't read or replace it
 
 fail() {
   gh issue comment "$N" -R "$REPO" --body "🤖 Agent stopped: $1. Handing back to a human." || true
@@ -25,12 +29,14 @@ cleanup() {
   fi
   rm -rf "$WT" "$GD"
 }
-trap cleanup EXIT
 trap 'fail "unexpected error (line $LINENO)"' ERR
 
 # --- trust gate: only issues opened by owners/members/collaborators (issue text becomes the prompt) ---
 ASSOC="$(gh api "repos/$REPO/issues/$N" --jq .author_association)"
 case "$ASSOC" in OWNER|MEMBER|COLLABORATOR) ;; *) fail "issue author is not a repo collaborator ($ASSOC)" ;; esac
+if [ "$REPO" != "$DEFAULT_REPO" ]; then
+  BASE_BRANCH="$(gh api "repos/$REPO" --jq .default_branch)" || fail "could not read repository default branch"
+fi
 
 # --- runner slot: a dedicated unix user per in-flight task, so parallel tasks can't touch each other.
 # The flock is held (fd 9) until this script exits.
@@ -39,7 +45,11 @@ for u in ${RUNNER_USERS:-}; do
   exec 9>"$WORK_ROOT/git/slot-$u.lock"
   if flock -n 9; then U="$u"; break; fi
 done
-[ -z "${RUNNER_USERS:-}" ] || [ -n "$U" ] || fail "no free runner slot"
+[ -z "${RUNNER_USERS:-}" ] || [ -n "$U" ] || {
+  gh issue edit "$N" -R "$REPO" --remove-label agent-working --add-label agent-ready >/dev/null
+  exit 75  # another repo used the last slot; Slack's queue retries this issue
+}
+trap cleanup EXIT
 
 # --- workspace: throwaway clone per issue, so nothing the runner leaves behind outlives the task ---
 cleanup

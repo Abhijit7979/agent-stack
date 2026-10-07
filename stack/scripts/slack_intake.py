@@ -27,6 +27,7 @@ COMMAND = re.compile(
     r"(?:\s+(?:for|to|about))?[ \t]*:?[ \t]*", re.I | re.M
 )
 REPO_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)", re.I)
+ISSUE_URL = re.compile(r"https://github\.com/([A-Za-z0-9-]+)/([A-Za-z0-9._-]+)/issues/([0-9]+)", re.I)
 LIST_ISSUES = re.compile(
     r"\b(?:what|which|list|show|current|open|how many|any)\b.*\bissues?\b"
     r"|\bissues?\b.*\b(?:we have|open|now)\b", re.I
@@ -35,6 +36,11 @@ DEVELOP = re.compile(
     r"^\s*(?:(?:please|can you|could you|would you|i want you to|i need you to)\s+)?"
     r"(?:implement|build|fix|develop|code|make|create|refactor|update|change|"
     r"start (?:working|development) on)\b", re.I
+)
+START_DEVELOPMENT = re.compile(
+    r"^\s*(?:(?:please|can you|could you)\s+)?(?:"
+    r"(?:start|begin|resume)\s+(?:the\s+)?(?:development|developing|work(?:ing)?)(?:\s+on)?"
+    r"|(?:fix|implement|work on)\s+(?:github\s+)?issue\s*#\d+)\b", re.I
 )
 GITHUB_ACTION = re.compile(
     r"^\s*(?:(?:please|can you|could you|would you|i want you to|i need you to)\s+)?"
@@ -87,6 +93,35 @@ def saved_repo(con, channel, root_ts):
 def remember_repo(con, channel, root_ts, repo):
     con.execute("INSERT OR REPLACE INTO thread_repos VALUES (?, ?, ?)", (channel, root_ts, repo))
     con.commit()
+
+
+def remember_issue(con, channel, root_ts, issue_url):
+    con.execute("CREATE TABLE IF NOT EXISTS thread_issues (channel TEXT NOT NULL, root_ts TEXT NOT NULL, "
+                "issue_url TEXT NOT NULL, PRIMARY KEY (channel, root_ts))")
+    con.execute("INSERT OR REPLACE INTO thread_issues VALUES (?, ?, ?)", (channel, root_ts, issue_url))
+    con.commit()
+
+
+def thread_issue(con, client, event, bot_user):
+    con.execute("CREATE TABLE IF NOT EXISTS thread_issues (channel TEXT NOT NULL, root_ts TEXT NOT NULL, "
+                "issue_url TEXT NOT NULL, PRIMARY KEY (channel, root_ts))")
+    row = con.execute("SELECT issue_url FROM thread_issues WHERE channel=? AND root_ts=?",
+                      (event["channel"], thread_root_ts(event))).fetchone()
+    if row:
+        return row[0]
+    try:
+        messages = client.conversations_replies(channel=event["channel"],
+                                                ts=thread_root_ts(event), limit=100)["messages"]
+    except Exception:
+        return None
+    for message in reversed(messages):
+        if message.get("user") != bot_user and not message.get("bot_id"):
+            continue
+        match = ISSUE_URL.search(message.get("text", ""))
+        if match:
+            remember_issue(con, event["channel"], thread_root_ts(event), match.group())
+            return match.group()
+    return None
 
 
 def repo_from_thread(client, event, bot_user, workspace_team):
@@ -160,23 +195,36 @@ def create_issue(repo, token, title, body, channel, ts, label="needs-human"):
     return issue["html_url"], labelled
 
 
-def dispatch_ready(number):
+def dispatch_ready(number, repo):
     """Start ready work now; cron remains the fallback when all slots are busy."""
     home = os.environ.get("HERMES_HOME", "/opt/data")
     env = {key: os.environ[key] for key in ("PATH", "HOME", "GH_TOKEN", "XDG_CONFIG_HOME")
            if key in os.environ}
     env["HERMES_HOME"] = home
-    result = subprocess.run([str(Path(home) / "scripts" / "dispatch.sh")],
+    result = subprocess.run([str(Path(home) / "scripts" / "dispatch.sh"), repo, str(number)],
                             env=env, cwd="/tmp", capture_output=True, text=True, timeout=30)
-    return result.returncode == 0 and bool(re.search(rf"^Dispatched #{number}\b", result.stdout, re.M))
+    return result.returncode == 0 and f"Dispatched {repo}#{number} " in result.stdout
 
 
-def track_job(con, channel, root_ts, issue_url, started):
-    number = int(issue_url.rstrip("/").rsplit("/", 1)[-1])
-    con.execute("CREATE TABLE IF NOT EXISTS jobs (issue INTEGER PRIMARY KEY, channel TEXT NOT NULL, "
-                "root_ts TEXT NOT NULL, state TEXT NOT NULL)")
-    con.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?)",
-                (number, channel, root_ts, "working" if started else "ready"))
+def ensure_jobs(con, default_repo):
+    con.execute("CREATE TABLE IF NOT EXISTS jobs_v2 (repo TEXT NOT NULL, issue INTEGER NOT NULL, "
+                "channel TEXT NOT NULL, root_ts TEXT NOT NULL, state TEXT NOT NULL, "
+                "PRIMARY KEY (repo, issue))")
+    if con.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jobs'").fetchone():
+        con.execute("INSERT OR IGNORE INTO jobs_v2 SELECT ?, issue, channel, root_ts, state FROM jobs",
+                    (default_repo,))
+        con.execute("DROP TABLE jobs")
+    con.commit()
+
+
+def track_job(con, channel, root_ts, issue_url, default_repo):
+    match = ISSUE_URL.search(issue_url)
+    if not match:
+        raise ValueError("GitHub returned an unexpected issue URL.")
+    repo, number = f"{match.group(1)}/{match.group(2)}", int(match.group(3))
+    ensure_jobs(con, default_repo)
+    con.execute("INSERT OR REPLACE INTO jobs_v2 VALUES (?, ?, ?, ?, ?)",
+                (repo, number, channel, root_ts, "ready"))
     con.commit()
 
 
@@ -187,6 +235,47 @@ def github_get(repo, token, path):
     )
     with urllib.request.urlopen(req, timeout=30) as response:
         return json.load(response)
+
+
+def github_write(repo, token, path, payload=None, method="POST"):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/{path}",
+        data=json.dumps(payload).encode() if payload is not None else None,
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                 "Content-Type": "application/json"}, method=method,
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response) if response.status != 204 else None
+
+
+def ensure_agent_labels(repo, token):
+    for name, color in (("agent-ready", "0E8A16"), ("agent-working", "FBCA04"),
+                        ("agent-pr", "1D76DB"), ("needs-human", "D93F0B")):
+        try:
+            github_get(repo, token, f"labels/{name}")
+        except urllib.error.HTTPError as exc:
+            if exc.code != 404:
+                raise
+            github_write(repo, token, "labels", {"name": name, "color": color})
+
+
+def queue_issue(repo, token, number):
+    issue = github_get(repo, token, f"issues/{number}")
+    if issue.get("state") != "open" or "pull_request" in issue:
+        raise ValueError("that issue is not open.")
+    if issue.get("author_association") not in ("OWNER", "MEMBER", "COLLABORATOR"):
+        raise ValueError("the issue author is not a repository collaborator.")
+    labels = {item["name"] for item in issue.get("labels", [])}
+    if "agent-pr" in labels:
+        return "pr"
+    if "agent-working" in labels:
+        return "working"
+    ensure_agent_labels(repo, token)
+    if "needs-human" in labels:
+        github_write(repo, token, f"issues/{number}/labels/needs-human", method="DELETE")
+    if "agent-ready" not in labels:
+        github_write(repo, token, f"issues/{number}/labels", {"labels": ["agent-ready"]})
+    return "ready"
 
 
 def issue_status(repo, token, number):
@@ -204,24 +293,29 @@ def issue_status(repo, token, number):
         return "failed", f"Development stopped on issue #{number}; please review it on GitHub."
     elif "agent-working" in labels:
         return "working", f"Development started on issue #{number}. I'll share the PR here when it is ready."
+    elif "agent-ready" in labels:
+        return "ready", None
     return None, None
 
 
-def poll_status(client, repo, token):
+def poll_status(client, default_repo, token):
     with closing(sqlite3.connect(STATE)) as con:
-        con.execute("CREATE TABLE IF NOT EXISTS jobs (issue INTEGER PRIMARY KEY, channel TEXT NOT NULL, "
-                    "root_ts TEXT NOT NULL, state TEXT NOT NULL)")
-        for number, channel, root_ts, previous in con.execute(
-                "SELECT issue, channel, root_ts, state FROM jobs").fetchall():
+        ensure_jobs(con, default_repo)
+        for repo, number, channel, root_ts, previous in con.execute(
+                "SELECT repo, issue, channel, root_ts, state FROM jobs_v2").fetchall():
             try:
+                if previous == "ready":
+                    dispatch_ready(number, repo)
                 state, message = issue_status(repo, token, number)
                 if not state or state == previous:
                     continue
-                client.chat_postMessage(channel=channel, thread_ts=root_ts, text=message)
+                if message:
+                    client.chat_postMessage(channel=channel, thread_ts=root_ts, text=message)
                 if state in ("pr", "failed"):
-                    con.execute("DELETE FROM jobs WHERE issue=?", (number,))
+                    con.execute("DELETE FROM jobs_v2 WHERE repo=? AND issue=?", (repo, number))
                 else:
-                    con.execute("UPDATE jobs SET state=? WHERE issue=?", (state, number))
+                    con.execute("UPDATE jobs_v2 SET state=? WHERE repo=? AND issue=?",
+                                (state, repo, number))
                 con.commit()
             except Exception as exc:
                 # Slack delivery can fail transiently; leave the row to retry next tick.
@@ -356,6 +450,8 @@ def main():
     github_token = os.environ["GH_TOKEN"]
     model = os.environ.get("SLACK_CHAT_MODEL", "openrouter/free")
     STATE.parent.mkdir(parents=True, exist_ok=True)
+    with closing(sqlite3.connect(STATE)) as con:
+        ensure_jobs(con, repo)
     threading.Thread(target=status_loop, args=(app.client, repo, github_token), daemon=True).start()
 
     def intake(event, say):
@@ -379,10 +475,11 @@ def main():
             try:
                 if len(files) > 1:
                     raise ValueError("please send one PDF at a time.")
-                unsupported_operation = bool(GITHUB_ACTION.match(text))
+                start_request = bool(START_DEVELOPMENT.match(text))
+                unsupported_operation = bool(GITHUB_ACTION.match(text)) and not start_request
                 issue_command = COMMAND.search(text)
-                develop = not issue_command and not unsupported_operation and bool(DEVELOP.match(text))
-                github_request = bool(files or issue_command or develop or LIST_ISSUES.search(text))
+                develop = not issue_command and not start_request and not unsupported_operation and bool(DEVELOP.match(text))
+                github_request = bool(files or issue_command or develop or start_request or LIST_ISSUES.search(text))
                 explicit_repo = repo_from_text(text)
                 member = workspace_member(event, app.client, workspace_team) if github_request or explicit_repo else False
                 if github_request and not member:
@@ -396,9 +493,25 @@ def main():
                 if github_request and not target_repo and re.search(r"\bthis repo\b", text, re.I):
                     raise ValueError("please include the GitHub repository URL so I choose the right repo.")
                 target_repo = target_repo or repo
-                if develop and target_repo != repo:
-                    reply = (f"Development is only configured for `{repo}`. I won't create a task in the "
-                             f"wrong repo; ask me to `create issue` in `{target_repo}` if you want a review-only issue.")
+                if start_request:
+                    match = ISSUE_URL.search(text)
+                    issue_url = match.group() if match else thread_issue(con, app.client, event, bot_user)
+                    if not issue_url:
+                        reply = "Please create an issue in this thread or send its GitHub issue URL first."
+                    else:
+                        match = ISSUE_URL.search(issue_url)
+                        target_repo = f"{match.group(1)}/{match.group(2)}"
+                        number = int(match.group(3))
+                        state = queue_issue(target_repo, github_token, number)
+                        if state == "pr":
+                            _, reply = issue_status(target_repo, github_token, number)
+                            reply = reply or f"A PR is already open for {issue_url}."
+                        elif state == "working":
+                            reply = f"Development is already running for {issue_url}."
+                        else:
+                            track_job(con, channel, root_ts, issue_url, repo)
+                            dispatch_ready(number, target_repo)
+                            reply = f"Queued development for {issue_url}. I'll post the PR in this thread."
                 elif (files or issue_command or develop) and not unsupported_operation:
                     if target_repo != repo:
                         try:
@@ -409,32 +522,24 @@ def main():
                             raise
                         if not details.get("permissions", {}).get("push") or not details.get("has_issues"):
                             raise ValueError(f"the bot cannot create issues in `{target_repo}`.")
+                    ensure_agent_labels(target_repo, github_token)
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
                     request = request_text(text, files[0].get("name") if files else None,
                                            pdf_text, develop=develop)
                     issue_attempted = True
-                    label = "agent-ready" if develop else "needs-human" if target_repo == repo else None
                     url, labelled = create_issue(target_repo, github_token, *request, channel, ts,
-                                                 label=label)
-                    if develop and labelled:
+                                                 label="agent-ready")
+                    if labelled:
+                        remember_issue(con, channel, root_ts, url)
+                        track_job(con, channel, root_ts, url, repo)
                         try:
-                            started = dispatch_ready(int(url.rstrip("/").rsplit("/", 1)[-1]))
+                            dispatch_ready(int(url.rstrip("/").rsplit("/", 1)[-1]), target_repo)
                         except (OSError, subprocess.TimeoutExpired):
-                            started = False
-                        track_job(con, channel, root_ts, url, started)
-                        reply = (f"Started development: {url}. I'll open a PR if the task succeeds."
-                                 if started else
-                                 f"Queued development: {url}. The scheduler will start it when a slot is free.")
-                    elif develop:
+                            pass  # the persisted queue retries on its next tick
+                        reply = f"Created {url} and queued development. I'll post the PR here."
+                    else:
                         reply = (f"Created {url}, but GitHub did not apply `agent-ready`. "
                                  "Development will not start until that label is added.")
-                    elif target_repo != repo:
-                        reply = f"Created {url} in `{target_repo}`. No development was started."
-                    else:
-                        reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
-                                 "by changing the label to `agent-ready`." if labelled else
-                                 f"Created {url}, but GitHub did not apply `needs-human`. "
-                                 "It will not be auto-triaged; please label it before approval.")
                 elif LIST_ISSUES.search(text):
                     reply = issue_reply(target_repo, github_token)
                 elif unsupported_operation:
