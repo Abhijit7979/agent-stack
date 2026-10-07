@@ -50,6 +50,9 @@ chmod 700 "$WT"  # other slot users can't even read it
 
 TITLE="$(gh issue view "$N" -R "$REPO" --json title --jq .title)"
 BODY="$(gh issue view "$N" -R "$REPO" --json body --jq .body)"
+# Slack requests may come from any workspace member, but a development request is
+# not permission to merge. A separate, explicit merge action is required.
+if [[ "$BODY" == "Submitted from Slack:"* ]]; then MERGE_MODE=pr; fi
 PROMPT="Resolve GitHub issue #$N in this repository.
 
 <issue>

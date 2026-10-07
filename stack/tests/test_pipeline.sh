@@ -24,7 +24,7 @@ cat > "$T/bin/gh" <<EOF
 echo "gh \$*" >> "$T/gh.log"
 case "\$1 \$2" in
   "repo clone") git clone -q "\${@:6}" "$T/origin.git" "\$4" 2>/dev/null ;;
-  "issue view") [[ "\$*" == *.title* ]] && echo "Fix the thing" || echo "Please fix it." ;;
+  "issue view") [[ "\$*" == *.title* ]] && echo "Fix the thing" || echo "\${ISSUE_BODY:-Please fix it.}" ;;
   "pr create")  echo "https://github.com/acme/app/pull/7" ;;
   "issue list") [[ "\$*" == *agent-working* ]] && { echo "\${WORKING:-0}"; exit; }
                 q="\${@: -1}"; echo '[{"number":13,"createdAt":"3"},{"number":11,"createdAt":"1"},{"number":12,"createdAt":"2"}]' | jq -r "\$q" ;;
@@ -72,6 +72,10 @@ check "workspace cleaned" '[ ! -d "$T/work/wt/5" ]'
 # 2. no branch protection -> PR only
 run AUTOMERGE=true
 check "PR-only without protection" '! grep -q "pr merge" "$T/gh.log" && grep -q "pr create" "$T/gh.log"'
+
+# 2b. Slack-origin work remains PR-only even if global auto-merge is ready.
+run AUTOMERGE=true PROTECTED=1 ISSUE_BODY='Submitted from Slack: https://app.slack.com/archives/C1/p123'
+check "Slack request stays PR-only" '! grep -q "pr merge" "$T/gh.log" && grep -q "pr create" "$T/gh.log"'
 
 # 3. runner changes nothing -> needs-human
 run RUNNER_DOES=none

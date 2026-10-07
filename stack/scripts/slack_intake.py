@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Small Slack intake: create review-only GitHub issues from messages or PDFs."""
+"""Slack chat and explicit development requests for the configured GitHub repo."""
 
 import hashlib
 import json
@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import urllib.error
@@ -28,12 +29,25 @@ LIST_ISSUES = re.compile(
     r"\b(?:what|which|list|show|current|open|how many|any)\b.*\bissues?\b"
     r"|\bissues?\b.*\b(?:we have|open|now)\b", re.I
 )
+DEVELOP = re.compile(
+    r"^\s*(?:(?:please|can you|could you|would you|i want you to|i need you to)\s+)?"
+    r"(?:implement|build|fix|develop|code|make|create|refactor|update|change|"
+    r"start (?:working|development) on)\b", re.I
+)
+GITHUB_ACTION = re.compile(
+    r"^\s*(?:(?:please|can you|could you|would you|i want you to|i need you to)\s+)?"
+    r"(?:create|make|open|add|delete|rename|merge|change)\s+"
+    r"(?:(?:a|an|the|new|github)\s+)*(?:repositor(?:y|ies)|repos?|branches?|pull requests?|PRs?)\b"
+    r"|^\s*(?:(?:please|can you|could you|would you)\s+)?"
+    r"(?:fix|implement|create|work on|start (?:working|development) on)\s+(?:github\s+)?issues?\s*#\d+\b",
+    re.I,
+)
 
 
-def request_text(text, filename=None, pdf_text=None):
+def request_text(text, filename=None, pdf_text=None, develop=False):
     """Return an issue title/body, or None when this is not an intake request."""
     match = COMMAND.match(text)
-    if not match and pdf_text is None:
+    if not match and pdf_text is None and not develop:
         return None
     content = text[match.end() :] if match else text.strip()
     lines = content.strip().splitlines()
@@ -44,7 +58,8 @@ def request_text(text, filename=None, pdf_text=None):
         raise ValueError("Issue title must be 120 characters or less.")
     body = "\n".join(lines[1:]).strip()
     if pdf_text is not None:
-        body = f"Plan from {filename}:\n\n{pdf_text.strip()}"
+        body = ((f"Slack request:\n\n{content.strip()}\n\n" if develop else "")
+                + f"Plan from {filename}:\n\n{pdf_text.strip()}")
     elif not body:
         body = title
     if len(body) > MAX_BODY_CHARS:
@@ -79,12 +94,14 @@ def pdf_to_text(file_info, slack_token):
     return extracted
 
 
-def create_issue(repo, token, title, body, channel, ts):
+def create_issue(repo, token, title, body, channel, ts, label="needs-human"):
+    if label not in ("needs-human", "agent-ready"):
+        raise ValueError("Unsupported issue label.")
     permalink = f"https://app.slack.com/archives/{channel}/p{ts.replace('.', '')}"
     payload = json.dumps({
         "title": title,
         "body": f"Submitted from Slack: {permalink}\n\n{body}",
-        "labels": ["needs-human"],
+        "labels": [label],
     }).encode()
     req = urllib.request.Request(
         f"https://api.github.com/repos/{repo}/issues",
@@ -99,8 +116,101 @@ def create_issue(repo, token, title, body, channel, ts):
     )
     with urllib.request.urlopen(req, timeout=30) as response:
         issue = json.load(response)
-    labelled = any(label["name"] == "needs-human" for label in issue.get("labels", []))
+    labelled = any(item["name"] == label for item in issue.get("labels", []))
     return issue["html_url"], labelled
+
+
+def dispatch_ready(number):
+    """Start ready work now; cron remains the fallback when all slots are busy."""
+    home = os.environ.get("HERMES_HOME", "/opt/data")
+    env = {key: os.environ[key] for key in ("PATH", "HOME", "GH_TOKEN", "XDG_CONFIG_HOME")
+           if key in os.environ}
+    env["HERMES_HOME"] = home
+    result = subprocess.run([str(Path(home) / "scripts" / "dispatch.sh")],
+                            env=env, cwd="/tmp", capture_output=True, text=True, timeout=30)
+    return result.returncode == 0 and bool(re.search(rf"^Dispatched #{number}\b", result.stdout, re.M))
+
+
+def track_job(con, channel, root_ts, issue_url, started):
+    number = int(issue_url.rstrip("/").rsplit("/", 1)[-1])
+    con.execute("CREATE TABLE IF NOT EXISTS jobs (issue INTEGER PRIMARY KEY, channel TEXT NOT NULL, "
+                "root_ts TEXT NOT NULL, state TEXT NOT NULL)")
+    con.execute("INSERT OR REPLACE INTO jobs VALUES (?, ?, ?, ?)",
+                (number, channel, root_ts, "working" if started else "ready"))
+    con.commit()
+
+
+def github_get(repo, token, path):
+    req = urllib.request.Request(
+        f"https://api.github.com/repos/{repo}/{path}",
+        headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json"},
+    )
+    with urllib.request.urlopen(req, timeout=30) as response:
+        return json.load(response)
+
+
+def issue_status(repo, token, number):
+    issue = github_get(repo, token, f"issues/{number}")
+    labels = {item["name"] for item in issue.get("labels", [])}
+    if "agent-pr" in labels:
+        # ponytail: first 100 comments cover a pilot issue; paginate if threads grow past that.
+        comments = github_get(repo, token, f"issues/{number}/comments?per_page=100")
+        pattern = re.compile(rf"https://github\.com/{re.escape(repo)}/pull/\d+", re.I)
+        for comment in reversed(comments):
+            match = pattern.search(comment.get("body", ""))
+            if match:
+                return "pr", f"Development finished for issue #{number}: {match.group()} (ready for review)."
+    elif "needs-human" in labels:
+        return "failed", f"Development stopped on issue #{number}; please review it on GitHub."
+    elif "agent-working" in labels:
+        return "working", f"Development started on issue #{number}. I'll share the PR here when it is ready."
+    return None, None
+
+
+def poll_status(client, repo, token):
+    with closing(sqlite3.connect(STATE)) as con:
+        con.execute("CREATE TABLE IF NOT EXISTS jobs (issue INTEGER PRIMARY KEY, channel TEXT NOT NULL, "
+                    "root_ts TEXT NOT NULL, state TEXT NOT NULL)")
+        for number, channel, root_ts, previous in con.execute(
+                "SELECT issue, channel, root_ts, state FROM jobs").fetchall():
+            try:
+                state, message = issue_status(repo, token, number)
+                if not state or state == previous:
+                    continue
+                client.chat_postMessage(channel=channel, thread_ts=root_ts, text=message)
+                if state in ("pr", "failed"):
+                    con.execute("DELETE FROM jobs WHERE issue=?", (number,))
+                else:
+                    con.execute("UPDATE jobs SET state=? WHERE issue=?", (state, number))
+                con.commit()
+            except Exception as exc:
+                # Slack delivery can fail transiently; leave the row to retry next tick.
+                print(f"Slack status update for issue #{number} failed ({type(exc).__name__})",
+                      file=sys.stderr, flush=True)
+                continue
+
+
+def status_loop(client, repo, token):
+    while True:
+        threading.Event().wait(45)
+        try:
+            poll_status(client, repo, token)
+        except Exception as exc:
+            print(f"Slack status polling failed ({type(exc).__name__})", file=sys.stderr, flush=True)
+
+
+def workspace_member(event, client, team_id):
+    """Resolve the speaker, not only the channel, before a GitHub operation."""
+    if not team_id or not event.get("user"):
+        return False
+    if any(event.get(key) not in (None, team_id)
+           for key in ("team", "team_id", "user_team", "source_team")):
+        return False
+    try:
+        user = client.users_info(user=event["user"])["user"]
+    except Exception:
+        return False
+    return user.get("team_id") == team_id and not user.get("is_stranger", False)
 
 
 def recent_issues(repo, token):
@@ -206,6 +316,7 @@ def main():
     github_token = os.environ["GH_TOKEN"]
     model = os.environ.get("SLACK_CHAT_MODEL", "openrouter/free")
     STATE.parent.mkdir(parents=True, exist_ok=True)
+    threading.Thread(target=status_loop, args=(app.client, repo, github_token), daemon=True).start()
 
     def intake(event, say):
         if not should_handle(event, bot_user, thread_engaged=True):
@@ -228,17 +339,41 @@ def main():
             try:
                 if len(files) > 1:
                     raise ValueError("please send one PDF at a time.")
-                if files or COMMAND.match(text):
+                unsupported_operation = bool(GITHUB_ACTION.match(text))
+                develop = not COMMAND.match(text) and not unsupported_operation and bool(DEVELOP.match(text))
+                if (files or COMMAND.match(text) or develop or LIST_ISSUES.search(text)) and not workspace_member(
+                        event, app.client, workspace_team):
+                    raise ValueError("only members of this Slack workspace can access GitHub through me.")
+                if (files or COMMAND.match(text) or develop) and not unsupported_operation:
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
-                    request = request_text(text, files[0].get("name") if files else None, pdf_text)
+                    request = request_text(text, files[0].get("name") if files else None,
+                                           pdf_text, develop=develop)
                     issue_attempted = True
-                    url, labelled = create_issue(repo, github_token, *request, channel, ts)
-                    reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
-                             "by changing the label to `agent-ready`." if labelled else
-                             f"Created {url}, but GitHub did not apply `needs-human`. "
-                             "It will not be auto-triaged; please label it before approval.")
+                    label = "agent-ready" if develop else "needs-human"
+                    url, labelled = create_issue(repo, github_token, *request, channel, ts,
+                                                 label=label)
+                    if develop and labelled:
+                        try:
+                            started = dispatch_ready(int(url.rstrip("/").rsplit("/", 1)[-1]))
+                        except (OSError, subprocess.TimeoutExpired):
+                            started = False
+                        track_job(con, channel, root_ts, url, started)
+                        reply = (f"Started development: {url}. I'll open a PR if the task succeeds."
+                                 if started else
+                                 f"Queued development: {url}. The scheduler will start it when a slot is free.")
+                    elif develop:
+                        reply = (f"Created {url}, but GitHub did not apply `agent-ready`. "
+                                 "Development will not start until that label is added.")
+                    else:
+                        reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
+                                 "by changing the label to `agent-ready`." if labelled else
+                                 f"Created {url}, but GitHub did not apply `needs-human`. "
+                                 "It will not be auto-triaged; please label it before approval.")
                 elif LIST_ISSUES.search(text):
                     reply = issue_reply(repo, github_token)
+                elif unsupported_operation:
+                    reply = (f"I can start development in `{repo}` from a task description, "
+                             "but cannot safely perform that GitHub operation from Slack yet.")
                 else:
                     reply = assistant_reply(text, model, session=session,
                                             speaker=event.get("user") if not direct else None)

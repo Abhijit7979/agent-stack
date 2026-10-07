@@ -27,6 +27,9 @@ class IntakeTest(unittest.TestCase):
                          ("fixing login", "fixing login"))
         self.assertEqual(intake.request_text("Implement this", "plan.pdf", "Step one"),
                          ("Implement this", "Plan from plan.pdf:\n\nStep one"))
+        self.assertEqual(intake.request_text("Implement this with React", "plan.pdf", "Step one", develop=True),
+                         ("Implement this with React",
+                          "Slack request:\n\nImplement this with React\n\nPlan from plan.pdf:\n\nStep one"))
         self.assertIsNone(intake.request_text("hello"))
 
     def test_issue_list_stays_out_of_model(self):
@@ -61,6 +64,64 @@ class IntakeTest(unittest.TestCase):
         self.assertIn("Submitted from Slack:", body["body"])
         self.assertTrue(labelled)
         self.assertTrue(url.endswith("/1"))
+
+    def test_explicit_development_labels_issue_and_dispatches_without_slack_tokens(self):
+        self.assertTrue(intake.DEVELOP.match("Can you build a home page?"))
+        self.assertFalse(intake.DEVELOP.match("How do I build a home page?"))
+        self.assertTrue(intake.COMMAND.match("create issue: Build a home page"))
+        self.assertTrue(intake.DEVELOP.match("Create an HTML home page"))
+        self.assertTrue(intake.GITHUB_ACTION.match("create a new repo"))
+        self.assertTrue(intake.GITHUB_ACTION.match("merge PR #3"))
+        self.assertTrue(intake.GITHUB_ACTION.match("fix issue #3"))
+        self.assertFalse(intake.GITHUB_ACTION.match("Build a home page and open a PR"))
+        self.assertEqual(intake.request_text("Fix login", develop=True), ("Fix login", "Fix login"))
+        response = io.BytesIO(json.dumps({"html_url": "https://github.com/acme/app/issues/2",
+                                          "labels": [{"name": "agent-ready"}]}).encode())
+        with patch.object(intake.urllib.request, "urlopen", return_value=response) as send:
+            self.assertEqual(intake.create_issue("acme/app", "secret", "Fix", "Details", "C123",
+                                                 "123.456", label="agent-ready"),
+                             ("https://github.com/acme/app/issues/2", True))
+        self.assertEqual(json.loads(send.call_args.args[0].data)["labels"], ["agent-ready"])
+        with patch.dict(intake.os.environ, {"HERMES_HOME": "/opt/data", "GH_TOKEN": "gh-secret",
+                                         "SLACK_BOT_TOKEN": "bot-secret", "SLACK_APP_TOKEN": "app-secret"}), \
+             patch.object(intake.subprocess, "run", return_value=subprocess.CompletedProcess([], 0,
+                                                                                "Dispatched #2 to opencode\n", "")) as run:
+            self.assertTrue(intake.dispatch_ready(2))
+            self.assertFalse(intake.dispatch_ready(3))
+        self.assertEqual(run.call_args.args[0], ["/opt/data/scripts/dispatch.sh"])
+        self.assertNotIn("SLACK_BOT_TOKEN", run.call_args.kwargs["env"])
+        self.assertNotIn("SLACK_APP_TOKEN", run.call_args.kwargs["env"])
+
+    def test_workspace_write_boundary(self):
+        client = types.SimpleNamespace(users_info=lambda user: {"user": {"team_id": "T1"}})
+        self.assertTrue(intake.workspace_member({"user": "U1", "team": "T1"}, client, "T1"))
+        self.assertFalse(intake.workspace_member({"user": "U1", "user_team": "EXT"}, client, "T1"))
+        self.assertFalse(intake.workspace_member({"user": "U1", "team": "T1"}, client, "T2"))
+        external = types.SimpleNamespace(users_info=lambda user: {"user": {"team_id": "EXT"}})
+        self.assertFalse(intake.workspace_member({"user": "U1"}, external, "T1"))
+
+    def test_status_posts_once_to_original_thread(self):
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(intake, "STATE", Path(directory) / "state.db"):
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                intake.track_job(con, "C123", "100.1", "https://github.com/acme/app/issues/2", False)
+            client = Mock()
+            with patch.object(intake, "issue_status", return_value=("working", "Started")):
+                intake.poll_status(client, "acme/app", "secret")
+                intake.poll_status(client, "acme/app", "secret")
+            client.chat_postMessage.assert_called_once_with(channel="C123", thread_ts="100.1",
+                                                            text="Started")
+            with patch.object(intake, "issue_status", return_value=("pr", "PR ready")):
+                intake.poll_status(client, "acme/app", "secret")
+                intake.poll_status(client, "acme/app", "secret")
+            self.assertEqual(client.chat_postMessage.call_count, 2)
+            with closing(sqlite3.connect(intake.STATE)) as con:
+                self.assertEqual(con.execute("SELECT count(*) FROM jobs").fetchone()[0], 0)
+        with patch.object(intake, "github_get", side_effect=[
+                {"labels": [{"name": "agent-pr"}]},
+                [{"body": "🤖 https://github.com/acme/app/pull/7 — ready"}]]):
+            self.assertIn("https://github.com/acme/app/pull/7",
+                          intake.issue_status("acme/app", "secret", 2)[1])
 
     def test_duplicate_message_is_ignored(self):
         with tempfile.TemporaryDirectory() as directory, closing(sqlite3.connect(Path(directory) / "state.db")) as con:
@@ -99,7 +160,8 @@ class IntakeTest(unittest.TestCase):
             instance = None
 
             def __init__(self, token):
-                self.client = types.SimpleNamespace(auth_test=lambda: {"user_id": "UBOT"})
+                self.client = types.SimpleNamespace(auth_test=lambda: {"user_id": "UBOT", "team_id": "T1"},
+                                                    users_info=lambda user: {"user": {"team_id": "T1"}})
                 self.handlers = {}
                 FakeApp.instance = self
 
@@ -134,10 +196,23 @@ class IntakeTest(unittest.TestCase):
                              chat.call_args_list[1].kwargs["session"])
             self.assertEqual([call.kwargs["speaker"] for call in chat.call_args_list], ["U1", "U2"])
 
+            say.reset_mock()
+            development = {"channel": "C123", "ts": "107.1", "thread_ts": "100.1",
+                           "text": "Can you build a home page and open a PR?", "team": "T1", "user": "U2"}
+            with patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/2", True)) as create, \
+                 patch.object(intake, "dispatch_ready", return_value=True) as dispatch:
+                handler(development, say)
+                handler(development, say)
+            create.assert_called_once()
+            self.assertEqual(create.call_args.kwargs["label"], "agent-ready")
+            dispatch.assert_called_once_with(2)
+            self.assertEqual(say.call_count, 1)
+            self.assertEqual(say.call_args.kwargs["thread_ts"], "100.1")
+
             # A lost GitHub POST response is uncertain: do not POST again on Slack retry.
             say.reset_mock(side_effect=True)
             uncertain = {"channel": "C123", "ts": "106.1", "thread_ts": "100.1",
-                         "text": "create issue: Fix signup", "team": "T1"}
+                         "text": "create issue: Fix signup", "team": "T1", "user": "U1"}
             post_attempts = []
 
             def lost_response(request, timeout):
@@ -157,7 +232,7 @@ class IntakeTest(unittest.TestCase):
             say.reset_mock(side_effect=True)
             say.side_effect = [RuntimeError("send failed"), None]
             issue = {"channel": "C123", "ts": "105.1", "thread_ts": "100.1",
-                     "text": "create issue: Fix login", "team": "T1"}
+                     "text": "create issue: Fix login", "team": "T1", "user": "U1"}
             with patch.object(intake, "create_issue", return_value=("https://github.com/acme/app/issues/1", True)) as create:
                 with self.assertRaises(RuntimeError):
                     handler(issue, say)
