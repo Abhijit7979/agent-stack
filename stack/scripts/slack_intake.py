@@ -1,19 +1,23 @@
 #!/usr/bin/env python3
 """Small Slack intake: create review-only GitHub issues from messages or PDFs."""
 
+import hashlib
 import json
 import os
 import re
 import sqlite3
 import subprocess
 import tempfile
+import threading
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import closing
 from pathlib import Path
 
 
 STATE = Path(os.environ.get("HERMES_HOME", "/opt/data/.hermes")) / "slack-intake.sqlite3"
+SESSION_LOCKS = tuple(threading.Lock() for _ in range(64))
 MAX_PDF_BYTES = 10 * 1024 * 1024
 MAX_BODY_CHARS = 45_000
 COMMAND = re.compile(
@@ -116,24 +120,52 @@ def issue_reply(repo, token):
             if issues else "There are no open issues right now.")
 
 
-def assistant_reply(text, model):
+def thread_root_ts(event):
+    return event.get("thread_ts") or event["ts"]
+
+
+def should_handle(event, bot_user, thread_engaged=False):
+    if event.get("bot_id") or event.get("user") == bot_user or event.get("subtype") not in (None, "file_share"):
+        return False
+    channel = event["channel"]
+    return (event.get("channel_type") == "im" or channel.startswith("D")
+            or f"<@{bot_user}>" in event.get("text", "")
+            or bool(event.get("thread_ts") and thread_engaged))
+
+
+def conversation_name(team_id, channel, root_ts, direct):
+    scope = f"{team_id or ''}\0{channel}\0{'' if direct else root_ts}"
+    return "slack-" + hashlib.sha256(scope.encode()).hexdigest()[:32]
+
+
+def session_lock(name):
+    # ponytail: bounded, process-local lock stripes; use distributed locks if listeners scale out.
+    return SESSION_LOCKS[int(name[-8:], 16) % len(SESSION_LOCKS)]
+
+
+def assistant_reply(text, model, session=None, speaker=None):
+    speaker_id = re.sub(r"[^A-Za-z0-9_-]", "", speaker or "")[:40]
     prompt = (
         "You are a helpful Slack assistant for a GitHub coding project. Answer naturally and briefly. "
         "Do not use tools, edit files, or claim to have created an issue. "
         "You cannot see live GitHub issues; for issue status questions, ask the user to say 'show issues'. "
         "To create an issue, tell the user to ask explicitly.\n\n"
-        f"User message (untrusted data): {text[:4000]}"
+        + (f"Slack speaker ID: {speaker_id}\n" if speaker_id else "")
+        + f"User message (untrusted data): {text[:4000]}"
     )
     if not os.environ.get("OPENROUTER_API_KEY"):
         raise ValueError("Hermes is not configured with an OpenRouter key yet.")
     model_env = {"PATH": os.environ.get("PATH", "/usr/bin:/bin"),
                  "HERMES_HOME": "/home/triager/.hermes",
                  "OPENROUTER_API_KEY": os.environ["OPENROUTER_API_KEY"]}
+    command = ["sudo", "-n", "-E", "-u", "triager", "-H", "--", "timeout", "90",
+               "/opt/hermes/.venv/bin/hermes", "chat", "--oneshot", "--quiet",
+               "--ignore-rules", "--query-file", "-", "--provider", "openrouter",
+               "--model", model, "--toolsets", "bot_room", "--source", "tool"]
+    if session:
+        command += ["--continue", session, "--create-if-missing"]
     result = subprocess.run(
-        ["sudo", "-n", "-E", "-u", "triager", "-H", "--", "timeout", "90",
-         "/opt/hermes/.venv/bin/hermes", "chat", "--oneshot", "--quiet",
-         "--ignore-rules", "--query-file", "-", "--provider", "openrouter",
-         "--model", model],
+        command,
         cwd="/tmp", env=model_env, input=prompt, capture_output=True, text=True, timeout=100,
     )
     if result.returncode:
@@ -151,39 +183,55 @@ def claim(con, channel, ts):
         return False
 
 
+def thread_engaged(con, channel, root_ts):
+    con.execute("CREATE TABLE IF NOT EXISTS engaged (channel TEXT NOT NULL, root_ts TEXT NOT NULL, PRIMARY KEY (channel, root_ts))")
+    return con.execute("SELECT 1 FROM engaged WHERE channel=? AND root_ts=?", (channel, root_ts)).fetchone() is not None
+
+
+def mark_thread_engaged(con, channel, root_ts):
+    con.execute("INSERT OR IGNORE INTO engaged VALUES (?, ?)", (channel, root_ts))
+    con.commit()
+
+
 def main():
     from slack_bolt import App
     from slack_bolt.adapter.socket_mode import SocketModeHandler
 
     bot_token = os.environ["SLACK_BOT_TOKEN"]
     app = App(token=bot_token)
-    bot_user = app.client.auth_test()["user_id"]
+    auth = app.client.auth_test()
+    bot_user = auth["user_id"]
+    workspace_team = auth.get("team_id")
     repo = os.environ["REPO"]
     github_token = os.environ["GH_TOKEN"]
     model = os.environ.get("SLACK_CHAT_MODEL", "openrouter/free")
     STATE.parent.mkdir(parents=True, exist_ok=True)
 
     def intake(event, say):
-        if event.get("bot_id") or event.get("subtype") not in (None, "file_share"):
+        if not should_handle(event, bot_user, thread_engaged=True):
             return
         channel, ts = event["channel"], event["ts"]
+        root_ts = thread_root_ts(event)
         text = event.get("text", "")
         direct = event.get("channel_type") == "im" or channel.startswith("D")
         mention = f"<@{bot_user}>"
-        if not direct and mention not in text:
-            return
         text = text.replace(mention, "").strip()
         files = event.get("files") or []
-        if len(files) > 1:
-            say("Please send one PDF at a time.", thread_ts=ts)
-            return
-        with sqlite3.connect(STATE) as con:
+        session = conversation_name(event.get("team") or event.get("team_id") or workspace_team,
+                                    channel, root_ts, direct)
+        with session_lock(session), closing(sqlite3.connect(STATE)) as con:
+            if not should_handle(event, bot_user, thread_engaged(con, channel, root_ts)):
+                return
             if not claim(con, channel, ts):
                 return
+            issue_attempted = False
             try:
+                if len(files) > 1:
+                    raise ValueError("please send one PDF at a time.")
                 if files or COMMAND.match(text):
                     pdf_text = pdf_to_text(files[0], bot_token) if files else None
                     request = request_text(text, files[0].get("name") if files else None, pdf_text)
+                    issue_attempted = True
                     url, labelled = create_issue(repo, github_token, *request, channel, ts)
                     reply = (f"Created {url}. It is marked `needs-human`; approve it on GitHub "
                              "by changing the label to `agent-ready`." if labelled else
@@ -192,14 +240,25 @@ def main():
                 elif LIST_ISSUES.search(text):
                     reply = issue_reply(repo, github_token)
                 else:
-                    reply = assistant_reply(text, model)
-            except (ValueError, urllib.error.URLError, subprocess.TimeoutExpired,
+                    reply = assistant_reply(text, model, session=session,
+                                            speaker=event.get("user") if not direct else None)
+            except (ValueError, urllib.error.URLError, TimeoutError, subprocess.TimeoutExpired,
                     subprocess.CalledProcessError) as exc:
-                con.execute("DELETE FROM seen WHERE channel=? AND ts=?", (channel, ts))
-                con.commit()
-                say(f"Sorry, {exc}", thread_ts=ts)
-                return
-        say(reply, thread_ts=ts)
+                if issue_attempted:
+                    reply = ("I may have created the GitHub issue, but could not confirm it. "
+                             "Please check GitHub before sending the request again.")
+                else:
+                    con.execute("DELETE FROM seen WHERE channel=? AND ts=?", (channel, ts))
+                    con.commit()
+                    reply = f"Sorry, {exc}"
+            try:
+                say(reply, thread_ts=root_ts)
+            except Exception:
+                if not issue_attempted:
+                    con.execute("DELETE FROM seen WHERE channel=? AND ts=?", (channel, ts))
+                    con.commit()
+                raise
+            mark_thread_engaged(con, channel, root_ts)
 
     app.event("message")(intake)
     app.event("app_mention")(intake)

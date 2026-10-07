@@ -1,5 +1,6 @@
 hermes-agent/
 .DS_Store
 .env
+__pycache__/
 *.log
 .claude/skills/
