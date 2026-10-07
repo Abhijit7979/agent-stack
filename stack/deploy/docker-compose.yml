@@ -7,7 +7,7 @@ services:
       context: ..
       dockerfile: deploy/Dockerfile
     container_name: agent-stack
-    command: gateway run
+    command: bash /stack/deploy/start.sh
     env_file: .env            # GH_TOKEN=... (gitignored, never committed)
     volumes:
       - hermes-data:/opt/data # named volume: WAL-safe on macOS (bind mounts are not)

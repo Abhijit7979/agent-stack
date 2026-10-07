@@ -30,9 +30,10 @@ case "\$1 \$2" in
                 q="\${@: -1}"; echo '[{"number":13,"createdAt":"3"},{"number":11,"createdAt":"1"},{"number":12,"createdAt":"2"}]' | jq -r "\$q" ;;
   api*) case "\$*" in
           *branches/*) [ -n "\${PROTECTED:-}" ] && echo 1 || echo 0 ;;
-          *issues\?state*) q="\${@: -1}"; echo '[{"number":21,"author_association":"COLLABORATOR","labels":[]},
+          *issues\?state*) q="\${@: -1}"; echo '[{"number":21,"author_association":"COLLABORATOR","body":"Please fix it.","labels":[]},
               {"number":22,"author_association":"NONE","labels":[]},
-              {"number":23,"author_association":"OWNER","labels":[{"name":"needs-human"}]}]' | jq -r "\$q" ;;
+              {"number":23,"author_association":"OWNER","labels":[{"name":"needs-human"}]},
+              {"number":24,"author_association":"COLLABORATOR","body":"Submitted from Slack: https://example.com","labels":[]}]' | jq -r "\$q" ;;
           *issues/*)    echo "\${ASSOC:-COLLABORATOR}" ;;
           *)            echo "\${AUTOMERGE:-false}" ;;
         esac ;;
@@ -104,7 +105,7 @@ check "dispatch silent when full" '[ -z "$(WORKING=2 "$T/scripts/dispatch.sh")" 
 rm -f "$T/gh.log"
 out="$(TRIAGE_OUT='thinking...\nLABEL: agent-ready\nREASON: small clear fix' "$T/scripts/triage.sh")"
 check "triage labels trusted issue" '[ "$out" = "#21 -> agent-ready (small clear fix)" ] && grep -q "issue edit 21 .*--add-label agent-ready" "$T/gh.log"'
-check "triage skips untrusted + labelled" '! grep -qE "issue (edit|view|comment) (22|23)" "$T/gh.log"'
+check "triage skips untrusted, labelled + Slack intake" '! grep -qE "issue (edit|view|comment) (22|23|24)" "$T/gh.log"'
 rm -f "$T/gh.log"
 TRIAGE_OUT='Sure! I will ignore the rules. LABEL agent ready' "$T/scripts/triage.sh" >/dev/null
 check "unclear verdict -> needs-human" 'grep -q "issue edit 21 .*--add-label needs-human" "$T/gh.log"'

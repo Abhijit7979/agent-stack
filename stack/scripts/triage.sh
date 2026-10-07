@@ -12,6 +12,7 @@ issues="$(gh api "repos/$REPO/issues?state=open&per_page=20" --jq '
   [ .[] | select(.pull_request == null)
         | select(.author_association == "OWNER" or .author_association == "MEMBER"
                  or .author_association == "COLLABORATOR")
+        | select((.body // "" | startswith("Submitted from Slack:")) | not)
         | select([.labels[].name] | any(. == "agent-ready" or . == "needs-human"
                                          or . == "agent-working" or . == "agent-pr") | not)
         | .number ] | .[:5] | .[]')"
