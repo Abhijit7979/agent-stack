@@ -371,7 +371,7 @@ def issue_status(repo, token, number):
         for comment in reversed(comments):
             match = pattern.search(comment.get("body", ""))
             if match:
-                return "pr", f"Development finished for issue #{number}: {match.group()} (ready for review)."
+                return "pr", f"Development finished for issue #{number}: {match.group()}."
     elif "needs-human" in labels:
         return "failed", f"Development stopped on issue #{number}; please review it on GitHub."
     elif "agent-working" in labels:
