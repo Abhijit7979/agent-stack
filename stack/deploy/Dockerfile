@@ -3,6 +3,9 @@
 # --prefix /usr/local: the base image's npm prefix is a toolchain dir not on PATH; npm blocks postinstall unless allowed.
 FROM nousresearch/hermes-agent:latest
 
+# Upstream contract: a fresh volume leaves the gateway (which runs cron) down unless seeded as running.
+ENV HERMES_GATEWAY_BOOTSTRAP_STATE=running
+
 # One unprivileged user per parallel slot (runner1, runner2) plus one for triage. /srv/agent-work is hermes-only; each
 # task's work tree is opened to its slot user by ACL in work-issue.sh.
 RUN apt-get -o Acquire::Retries=3 update \
