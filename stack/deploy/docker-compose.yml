@@ -1,6 +1,5 @@
 # Local stand-in for the VPS. From stack/deploy/:
-#   docker compose up -d --build
-#   docker compose exec hermes bash /stack/deploy/install.sh
+#   docker compose up -d --build      (start.sh runs install.sh on every boot)
 services:
   hermes:
     build:

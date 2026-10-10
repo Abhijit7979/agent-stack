@@ -17,7 +17,7 @@ hermes_agent/
     ├── scripts/work-issue.sh    # one issue: fresh clone → runner → PR → auto-merge (guardrails live here)
     ├── deploy/Dockerfile        # official Hermes image + gh, opencode, runner1/runner2/triager users
     ├── deploy/docker-compose.yml# local stand-in for the VPS (token in gitignored deploy/.env)
-    ├── deploy/install.sh        # install into HERMES_HOME: scripts, labels, cron jobs
+    ├── deploy/install.sh        # install into HERMES_HOME: scripts, labels, cron jobs (run by start.sh on boot)
     └── tests/test_pipeline.sh   # offline check, stubbed gh/opencode — run after any script change
 ```
 
@@ -60,7 +60,7 @@ Hermes already ships most of what we need. Look there before writing anything:
 
 - Run OpenCode headless in a checkout:
   `opencode run --dir <checkout> -m opencode/longcat-2.5-preview-free "<task>"`
-- Local stack: `cd stack/deploy && docker compose up -d --build && docker compose exec hermes bash /stack/deploy/install.sh`
+- Local stack: `cd stack/deploy && docker compose up -d --build` (`start.sh` runs `install.sh` on every boot)
 - The model is `opencode/longcat-2.5-preview-free`, and the fallback is `opencode/nemotron-3-ultra-free`.
   - Both are set in **one place** in `stack/config/`.
   - Never hardcode the model name anywhere else.
