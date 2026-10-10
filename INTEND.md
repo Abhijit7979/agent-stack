@@ -108,4 +108,4 @@ Deadline: 2 weeks from the start, with the metrics above being tracked.
 - [x] Name the target repo and confirm it passes the readiness gate (CI `test` required, auto-merge on).
 - [x] Create the bot account and token (classic, `repo` scope only), and set up branch protection.
 - [x] Local Docker run end to end: issue #1 → triage → OpenCode → PR #2 → CI green → auto-merged (2026-10-06).
-- [ ] Provision Hermes and OpenCode on the VPS (same Docker setup).
+- [x] Provision Hermes and OpenCode on the VPS (same Docker setup): Openship project `agent-stack-vps` on server `abhijit-main-agents`; issue #10 → triage → PR #11 → CI green → auto-merged (2026-10-10).
