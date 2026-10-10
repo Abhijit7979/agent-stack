@@ -1,7 +1,8 @@
 # Official Hermes image + what the stack needs: gh, opencode, and unprivileged runner users
 # for the coding agent (it can't read /opt/data, where GH_TOKEN and Hermes state live).
 # --prefix /usr/local: the base image's npm prefix is a toolchain dir not on PATH; npm blocks postinstall unless allowed.
-FROM nousresearch/hermes-agent:latest
+# Pinned (Hermes 0.21.6): `latest` drifted twice in one day. Bump on purpose, then rebuild + retest.
+FROM nousresearch/hermes-agent@sha256:9774f4f39a9bb8c2f68ce728ed5e99ddbad282163be56764afacf88ed952b784
 
 # Upstream contract: a fresh volume leaves the gateway (which runs cron) down unless seeded as running.
 ENV HERMES_GATEWAY_BOOTSTRAP_STATE=running
